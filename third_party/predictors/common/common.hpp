@@ -2,6 +2,7 @@
 
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/prompt.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include "nlohmann/json.hpp"
 #include <regex>
@@ -103,10 +104,20 @@ public:
 		std::stringstream ss;
 		idx_t col_i = 0;
 		for (const auto mask_i : info.input_mask) {
-			ss << info.input_set_names[col_i] << " = `";
-			ss << input.GetValue(mask_i, row).ToSQLString();
-			if (col_i <= info.input_mask.size())
-				ss << line_end;
+			const auto &col_name = info.input_set_names[col_i];
+			bool is_emb_col = false;
+			for (const auto &[src, emb] : info.embedding_column_map) {
+				if (StringUtil::CIEquals(col_name, emb)) {
+					is_emb_col = true;
+					break;
+				}
+			}
+			if (!is_emb_col) {
+				ss << col_name << " = `";
+				ss << input.GetValue(mask_i, row).ToSQLString();
+				if (col_i <= info.input_mask.size())
+					ss << line_end;
+			}
 			col_i++;
 		}
 		return ss.str();

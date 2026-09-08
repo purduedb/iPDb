@@ -359,3 +359,4 @@ extension_external
 test/sql/pragma/output.json
 tools/pythonpkg/duckdb_build/
 .venv
+.claude

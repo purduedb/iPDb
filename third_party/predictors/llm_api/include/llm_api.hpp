@@ -16,8 +16,9 @@ namespace duckdb {
 // A group of semantically similar rows (by cosine similarity of their input-column embeddings).
 // rows[0] is the representative sent to the LLM; its result is propagated to all other members.
 struct TupleCluster {
-	std::string key;    // embed_prompt string of the representative row (used for LLM prompt + cache)
-	vector<idx_t> rows; // rows[0] is the representative
+	std::string key;      // embed_prompt string of the representative row (used for LLM prompt + cache)
+	vector<idx_t> rows;   // rows[0] is the representative
+	vector<idx_t> sample; // subset of rows[1:] chosen for post-hoc verification
 };
 
 struct BatchResult {
@@ -91,8 +92,21 @@ private:
 	// Propagate one LLM output to every row in its cluster (or to the row directly).
 	// Encapsulates the #if LLM_USE_CLUSTER branching that is otherwise duplicated in
 	// the main processing loop and the batch-failure retry loop of PredictChunk.
+	// When rep_outputs is non-null the cluster key→output mapping is recorded there
+	// so VerifyClusters can compare against sampled rows later.
 	void PropagateSingleResult(const std::string &llm_out, idx_t unprocessed_idx,
 							   map<string, vector<idx_t>> &tuple_id_map,
-							   DataChunk &output, const PredictInfo &info);
+							   DataChunk &output, const PredictInfo &info,
+							   map<string, string> *rep_outputs = nullptr);
+
+	// Post-hoc cluster verification: for each cluster's sampled rows, runs the LLM
+	// individually and overwrites the output for any row whose result differs from its
+	// cluster representative's result.
+	void VerifyClusters(const DataChunk &input, DataChunk &output,
+	                    const std::vector<TupleCluster> &clusters,
+	                    const map<string, string> &rep_outputs,
+	                    const PredictInfo &info);
+	static bool OutputsMatch(const std::string &a, const std::string &b,
+	                         const PredictInfo &info);
 };
 } // namespace duckdb

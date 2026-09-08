@@ -25,8 +25,10 @@ void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, Data
 #if LLM_USE_THREADS
 	map<string, vector<idx_t>> tuple_id_map {};
 	vector<string> unprocessed {};
+	map<string, string> rep_outputs {};  // cluster key → LLM result; used by VerifyClusters
 
 #if LLM_USE_CLUSTER
+	std::vector<TupleCluster> clusters;
 	if (task == PREDICT_EMBED_TASK) {
 		for (idx_t i = 0; i < rows; ++i) {
 			unprocessed.push_back(input.GetValue(info.input_mask[0], i).ToSQLString());
@@ -34,7 +36,8 @@ void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, Data
 	} else {
 		// Cluster rows by semantic similarity; only the representative per cluster is
 		// sent to the LLM and its result is propagated to all cluster members.
-		const auto clusters = GroupByClusters(input, rows, info);
+		clusters = GroupByClusters(input, rows, info);
+		LLM_LOG("No. of clusters: " + std::to_string(clusters.size()) + "\n");
 		for (const auto &cluster : clusters) {
 			if (auto hit = this->cache.find(cluster.key); this->use_cache && hit != this->cache.end()) {
 				for (const idx_t row : cluster.rows) {
@@ -89,6 +92,7 @@ void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, Data
 		LLM_LOG("Max Batch Size: " + std::to_string(imp_batch_size) + ", Unprocessed: " + std::to_string(unprocessed_rows) + ", Rounds: " + std::to_string(rounds) + "\n");
 	}
 
+	LLM_LOG("Rows: " + std::to_string(unprocessed_rows) + ", Rounds: " + std::to_string(rounds) + "\n");
 	double progress_step = 100.0 / rounds;
 	double progress = 0;
 	int step = 1;
@@ -150,8 +154,9 @@ void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, Data
 				}
 #if LLM_USE_CLUSTER
 				prompt_util.extract_array_data(result->outputs[0], output, tuple_id_map, frow, info, result->n_rows,
-										   [this](const string &embedded, const string &llm_out) {
+										   [this, &rep_outputs](const string &embedded, const string &llm_out) {
 											   if (this->use_cache) { cache[embedded] = llm_out; }
+											   rep_outputs[embedded] = llm_out;
 										   });
 #else
 				if (this->use_cache) {
@@ -207,7 +212,7 @@ void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, Data
 					output.SetCardinality(result->embeddings.size());
 				} else {
 					for (size_t i = 0; i < n_rows; i++) {
-						PropagateSingleResult(result->outputs[i], frow + i, tuple_id_map, output, info);
+						PropagateSingleResult(result->outputs[i], frow + i, tuple_id_map, output, info, &rep_outputs);
 					}
 				}
 			}
@@ -237,13 +242,18 @@ void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, Data
 			total_out_tokens += result->out_tokens;
 
 			if (result->Success()) {
-				PropagateSingleResult(result->outputs[0], unprocessed_idx, tuple_id_map, output, info);
+				PropagateSingleResult(result->outputs[0], unprocessed_idx, tuple_id_map, output, info, &rep_outputs);
 			}/**/
 		}
 		futures.clear();
 		const steady_clock::time_point b_te = steady_clock::now();
 		sub_secs += duration_cast<std::chrono::seconds>(b_te - b_ts).count();
 	}
+#if LLM_USE_CLUSTER
+	if (task != PREDICT_EMBED_TASK) {
+		VerifyClusters(input, output, clusters, rep_outputs, info);
+	}
+#endif
 #else
 	for (size_t batch = 0; batch < rounds; batch++) {
 		const int frow = batch * batch_size; // Offset of first row
@@ -575,6 +585,68 @@ void LlmApiPredictor::PredictJoin(ClientContext &client, DataChunk &input, DataC
 	stats->inputs_used += total_in;
 	stats->outputs_used += total_out;
 	stats->tokens_used += total_tokens;
+}
+
+// Returns true when the parsed output columns of 'a' and 'b' are identical.
+// On any parse error returns false so the sample row is treated as a mismatch.
+bool LlmApiPredictor::OutputsMatch(const std::string &a, const std::string &b, const PredictInfo &info) {
+	try {
+		const auto ja = nlohmann::json::parse(PromptUtil::extract_json(a));
+		const auto jb = nlohmann::json::parse(PromptUtil::extract_json(b));
+		for (const auto &col : info.result_set_names) {
+			const auto va = ja.contains(col) ? ja[col] : nlohmann::json{};
+			const auto vb = jb.contains(col) ? jb[col] : nlohmann::json{};
+			if (va != vb) {
+				return false;
+			}
+		}
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+void LlmApiPredictor::VerifyClusters(const DataChunk &input, DataChunk &output,
+                                      const std::vector<TupleCluster> &clusters,
+                                      const map<string, string> &rep_outputs,
+                                      const PredictInfo &info) {
+	LLM_LOG("VerifyClusters: checking " + std::to_string(clusters.size()) + " clusters\n");
+	idx_t corrections = 0;
+	for (const auto &cluster : clusters) {
+		if (cluster.sample.empty()) {
+			continue;
+		}
+		// Locate the representative's LLM output from this pass or the cache.
+		std::string rep_result;
+		auto it = rep_outputs.find(cluster.key);
+		if (it != rep_outputs.end()) {
+			rep_result = it->second;
+		} else if (use_cache) {
+			auto cache_it = cache.find(cluster.key);
+			if (cache_it == cache.end()) {
+				continue;
+			}
+			rep_result = cache_it->second;
+		} else {
+			continue;
+		}
+		for (const idx_t sample_row : cluster.sample) {
+			const auto sample_prompt =
+			    PromptUtil::embed_prompt(sample_row, input, info, /*is_multi=*/true);
+			auto result = PredictOne(*api, sample_prompt, sample_row);
+			if (!result->Success() || result->outputs.empty()) {
+				continue;
+			}
+			const auto &sample_result = result->outputs[0];
+			if (!OutputsMatch(rep_result, sample_result, info)) {
+				LLM_LOG("VerifyClusters: mismatch at row " + std::to_string(sample_row) +
+				        " — applying individual result\n");
+				prompt_util.extract_row_data(sample_result, sample_row, output, info);
+				++corrections;
+			}
+		}
+	}
+	LLM_LOG("VerifyClusters: " + std::to_string(corrections) + " correction(s) applied\n");
 }
 
 } // namespace duckdb
