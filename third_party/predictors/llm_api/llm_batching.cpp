@@ -55,13 +55,11 @@ std::unique_ptr<BatchResult> LlmApiPredictor::PredictBatch(OpenAI &api, const ve
 		auto req_time = duration_cast<std::chrono::seconds>(req_te - req_ts).count();
 		LLM_LOG("Batch request time (s):" + std::to_string(req_time) + "\n");
 		if (completion.empty()) {
-			LLM_LOG("Batch call failed! Falling back to row wise calls. Error: JSON parsing failed!\n");
+			LLM_LOG( "Batch call failed! Falling back to row wise calls. Error: JSON parsing failed!\n");
 		} else if (completion.contains("error")) {
-			LLM_LOG("Batch call failed! Falling back to row wise calls. Error: " + completion["error"].get<string>() + "\n");
+			CheckApiError(completion, "Batch call");
+			LLM_LOG( "Falling back to row wise calls.\n");
 			LLM_LOG(request.dump());
-			if (completion["code"] == 429) {
-				LLM_LOG("Too much requests!\n");
-			}
 		} else {
 			tokens += completion["usage"]["total_tokens"].get<int>();
 			in_tokens += completion["usage"]["prompt_tokens"].get<int>();
@@ -133,10 +131,7 @@ std::unique_ptr<BatchResult> LlmApiPredictor::PredictEmbedBatch(OpenAI &api, con
 	auto req_time = duration_cast<std::chrono::seconds>(req_te - req_ts).count();
 	LLM_LOG("Batch request time (s):" + std::to_string(req_time) + "\n");
 	if (embeddings.contains("error")) {
-		LLM_LOG("Batch call failed! Falling back to row wise calls. Error: " + embeddings["error"].get<string>() + "\n");
-		if (embeddings["code"] == 429) {
-			LLM_LOG("Too much requests!\n");
-		}
+		CheckApiError(embeddings, "Embedding batch call");
 	} else {
 		tokens += embeddings["usage"]["total_tokens"].get<int>();
 		in_tokens += embeddings["usage"]["prompt_tokens"].get<int>();
@@ -187,10 +182,7 @@ std::unique_ptr<BatchResult> LlmApiPredictor::PredictOne(OpenAI &api, const stri
 	auto req_time = duration_cast<std::chrono::seconds>(req_te - req_ts).count();
 	LLM_LOG("Request time (s):" + std::to_string(req_time) + "\n");
 	if (completion.contains("error")) {
-		LLM_LOG("LLM call failed! Error: " + completion["error"].get<string>() + "\n");
-		if (completion["code"] == 429) {
-			LLM_LOG("Too much requests!\n");
-		}
+		CheckApiError(completion, "LLM call");
 		result->outputs.emplace_back("");
 	}
 	total_time += req_time;

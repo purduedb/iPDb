@@ -84,24 +84,17 @@ private:
 	void GenerateGrammar();
 	std::string GenerateSystemMessage(bool is_array) const;
 
+	static void CheckApiError(const nlohmann::json &completion, const string &context);
 	nlohmann::json BuildSingleResponseFormat() const;
 	nlohmann::json BuildArrayResponseFormat(idx_t n_rows = 0) const;
 
 	std::vector<std::vector<float>> EmbedTexts(const std::vector<std::string> &texts) const;
 	static std::string ExtractContent(const nlohmann::json &completion);
-	// Propagate one LLM output to every row in its cluster (or to the row directly).
-	// Encapsulates the #if LLM_USE_CLUSTER branching that is otherwise duplicated in
-	// the main processing loop and the batch-failure retry loop of PredictChunk.
-	// When rep_outputs is non-null the cluster key→output mapping is recorded there
-	// so VerifyClusters can compare against sampled rows later.
 	void PropagateSingleResult(const std::string &llm_out, idx_t unprocessed_idx,
 							   map<string, vector<idx_t>> &tuple_id_map,
 							   DataChunk &output, const PredictInfo &info,
 							   map<string, string> *rep_outputs = nullptr);
 
-	// Post-hoc cluster verification: for each cluster's sampled rows, runs the LLM
-	// individually and overwrites the output for any row whose result differs from its
-	// cluster representative's result.
 	void VerifyClusters(const DataChunk &input, DataChunk &output,
 	                    const std::vector<TupleCluster> &clusters,
 	                    const map<string, string> &rep_outputs,

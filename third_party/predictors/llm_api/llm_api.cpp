@@ -69,4 +69,25 @@ std::string LlmApiPredictor::ExtractContent(const nlohmann::json &completion) {
 	return {};
 }
 
+void LlmApiPredictor::CheckApiError(const nlohmann::json &completion, const string &context) {
+	const int code = completion.contains("code") ? completion["code"].get<int>() : -1;
+	const string reason =
+	    completion.contains("error") && completion["error"].is_string() ? completion["error"].get<string>() : "unknown error";
+
+	if (code == static_cast<int>(HTTPStatusCode::Unauthorized_401)) {
+		throw HTTPException(context + " failed with 401: " + reason +
+		                    ". Check that the configured API key/secret is valid.");
+	}
+
+	if (code == -1) {
+		LLM_LOG( context + " failed! Connection error: " + reason + "\n");
+	} else {
+		LLM_LOG( context + " failed! HTTP " + std::to_string(code) + " (" +
+		        HTTPUtil::GetStatusMessage(HTTPUtil::ToStatusCode(code)) + "): " + reason + "\n");
+		if (code == static_cast<int>(HTTPStatusCode::TooManyRequests_429)) {
+			LLM_LOG( "Rate limited by the API - consider lowering req_per_min or batch_size.\n");
+		}
+	}
+}
+
 } // namespace duckdb
