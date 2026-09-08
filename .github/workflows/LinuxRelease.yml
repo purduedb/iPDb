@@ -102,7 +102,7 @@ jobs:
         quay.io/pypa/manylinux_2_28_${{ matrix.config.image }}                  \
         bash -c "
           set -e
-          yum install -y perl-IPC-Cmd gcc-toolset-12 gcc-toolset-12-gcc-c++ openssl-devel
+          yum install -y perl-IPC-Cmd gcc-toolset-12 gcc-toolset-12-gcc-c++ openssl-devel libcurl-devel
 
           # libssl.a/libcrypto.a (needed for STATIC_OPENSSL=1) only live in
           # AlmaLinux 8's devel repo, which isn't enabled by default here -
@@ -112,7 +112,14 @@ jobs:
           source /opt/rh/gcc-toolset-12/enable
           export CC=gcc
           export CXX=g++
-          export EXTRA_CMAKE_VARIABLES=\"-DCMAKE_EXE_LINKER_FLAGS=-ldl\"
+
+          # libcurl-devel only ships a shared libcurl.so (no static archive),
+          # and that .so is dynamically linked against this container's
+          # libssl.so.1.1 / libcrypto.so.1.1 - which don't exist on the bare
+          # runner this binary is later executed on. Build a static libcurl
+          # against the static OpenSSL above so it's fully embedded instead.
+          bash $PWD/scripts/build_static_curl.sh /opt/curl-static
+          export EXTRA_CMAKE_VARIABLES=\"-DCURL_INCLUDE_DIR=/opt/curl-static/include -DCURL_LIBRARY=/opt/curl-static/lib/libcurl.a -DCMAKE_EXE_LINKER_FLAGS=-ldl\"
 
           git config --global --add safe.directory $PWD
           make -C $PWD
@@ -202,7 +209,7 @@ jobs:
 
     - name: Install Ninja
       shell: bash
-      run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build libssl-dev
+      run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build libssl-dev libcurl4-openssl-dev
 
     - name: Setup Ccache
       uses: hendrikmuhs/ccache-action@main

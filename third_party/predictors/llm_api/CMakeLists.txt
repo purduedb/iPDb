@@ -3,9 +3,9 @@ if(POLICY CMP0063)
 endif()
 
 find_package(OpenSSL REQUIRED)
-# find_package(CURL REQUIRED)
+find_package(CURL REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
-# include_directories(${CURL_INCLUDE_DIRS})
+include_directories(${CURL_INCLUDE_DIRS})
 include_directories(include ${DUCKDB_MODULE_BASE_DIR}/third_party/httplib)
 
 add_library(duckdb_llm_api STATIC
@@ -17,7 +17,7 @@ add_library(duckdb_llm_api STATIC
         llm_dedup.cpp)
 target_compile_definitions(duckdb_llm_api PRIVATE $<$<BOOL:${ENABLE_LLM_API}>:ENABLE_LLM_API>)
 
-# target_link_libraries(duckdb_llm_api ${CURL_LIBRARIES})
+target_link_libraries(duckdb_llm_api ${CURL_LIBRARIES})
 target_link_libraries(duckdb_llm_api duckdb_mbedtls ${OPENSSL_LIBRARIES})
 
 target_include_directories(
