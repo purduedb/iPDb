@@ -28,6 +28,7 @@ cd "curl-${CURL_VERSION}"
   --disable-shared \
   --enable-static \
   --with-openssl \
+  --without-zlib \
   --without-libpsl \
   --without-libidn2 \
   --without-brotli \
