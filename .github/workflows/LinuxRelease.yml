@@ -97,11 +97,12 @@ jobs:
         -e ENABLE_EXTENSION_AUTOINSTALL=1                                      \
         -e BUILD_BENCHMARK=1                                                   \
         -e FORCE_WARN_UNUSED=1                                                 \
+        -e ENABLE_LLM_API=1                                                    \
         quay.io/pypa/manylinux_2_28_${{ matrix.config.image }}                  \
         bash -c "
           set -e
-          yum install -y perl-IPC-Cmd gcc-toolset-12 gcc-toolset-12-gcc-c++
-        
+          yum install -y perl-IPC-Cmd gcc-toolset-12 gcc-toolset-12-gcc-c++ openssl-devel libcurl-devel
+
           source /opt/rh/gcc-toolset-12/enable
           export CC=gcc
           export CXX=g++
@@ -112,28 +113,23 @@ jobs:
 
     - name: Print platform
       shell: bash
-      run: ./build/release/duckdb -c "PRAGMA platform;"
+      run: ./build/release/ipdb -c "PRAGMA platform;"
 
     - name: Deploy
       shell: bash
-      env:
-        AWS_ENDPOINT_URL: ${{ secrets.S3_DUCKDB_STAGING_ENDPOINT }}
-        AWS_ACCESS_KEY_ID: ${{ secrets.S3_DUCKDB_STAGING_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_DUCKDB_STAGING_KEY }}
       run: |
         python3 scripts/amalgamation.py
-        zip -j duckdb_cli-linux-${{ matrix.config.arch }}.zip build/release/duckdb
-        gzip -9 -k -n -c build/release/duckdb > duckdb_cli-linux-${{ matrix.config.arch }}.gz
+        zip -j ipdb-cli-linux-${{ matrix.config.arch }}.zip build/release/ipdb
+        gzip -9 -k -n -c build/release/ipdb > ipdb-cli-linux-${{ matrix.config.arch }}.gz
         zip -j libduckdb-linux-${{ matrix.config.arch }}.zip build/release/src/libduckdb*.* src/amalgamation/duckdb.hpp src/include/duckdb.h
-        ./scripts/upload-assets-to-staging.sh github_release libduckdb-linux-${{ matrix.config.arch }}.zip duckdb_cli-linux-${{ matrix.config.arch }}.zip duckdb_cli-linux-${{ matrix.config.arch }}.gz
 
     - uses: actions/upload-artifact@v4
       with:
-        name: duckdb-binaries-linux-${{ matrix.config.arch }}
+        name: ipdb-binaries-linux-${{ matrix.config.arch }}
         path: |
           libduckdb-linux-${{ matrix.config.arch }}.zip
-          duckdb_cli-linux-${{ matrix.config.arch }}.zip
-          duckdb_cli-linux-${{ matrix.config.arch }}.gz
+          ipdb-cli-linux-${{ matrix.config.arch }}.zip
+          ipdb-cli-linux-${{ matrix.config.arch }}.gz
 
     - name: Test
       shell: bash
@@ -149,13 +145,13 @@ jobs:
     - name: Tools Tests
       shell: bash
       run: |
-        python3 -m pytest tools/shell/tests --shell-binary build/release/duckdb
+        python3 -m pytest tools/shell/tests --shell-binary build/release/ipdb
 
     - name: Examples
       shell: bash
       run: |
         build/release/benchmark/benchmark_runner benchmark/micro/update/update_with_join.benchmark
-        build/release/duckdb -c "COPY (SELECT 42) TO '/dev/stdout' (FORMAT PARQUET)" | cat
+        build/release/ipdb -c "COPY (SELECT 42) TO '/dev/stdout' (FORMAT PARQUET)" | cat
 
  upload-libduckdb-src:
     name: Upload libduckdb-src.zip
@@ -170,14 +166,14 @@ jobs:
 
     - name: Deploy
       shell: bash
-      env:
-        AWS_ENDPOINT_URL: ${{ secrets.S3_DUCKDB_STAGING_ENDPOINT }}
-        AWS_ACCESS_KEY_ID: ${{ secrets.S3_DUCKDB_STAGING_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_DUCKDB_STAGING_KEY }}
       run: |
         python3 scripts/amalgamation.py
         zip -j libduckdb-src.zip src/amalgamation/duckdb.hpp src/amalgamation/duckdb.cpp src/include/duckdb.h src/include/duckdb_extension.h
-        ./scripts/upload-assets-to-staging.sh github_release libduckdb-src.zip
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: libduckdb-src
+        path: libduckdb-src.zip
 
  symbol-leakage:
     name: Symbol Leakage
@@ -199,7 +195,7 @@ jobs:
 
     - name: Install Ninja
       shell: bash
-      run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build
+      run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build libssl-dev libcurl4-openssl-dev
 
     - name: Setup Ccache
       uses: hendrikmuhs/ccache-action@main
@@ -209,6 +205,8 @@ jobs:
 
     - name: Build
       shell: bash
+      env:
+        ENABLE_LLM_API: 1
       run: make
 
     - name: Symbol Leakage Test
