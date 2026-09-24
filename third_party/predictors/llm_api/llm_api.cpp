@@ -79,8 +79,13 @@ void LlmApiPredictor::CheckApiError(const nlohmann::json &completion, const stri
 		                    ". Check that the configured API key/secret is valid.");
 	}
 
+	if (code == static_cast<int>(HTTPStatusCode::NotFound_404)) {
+		throw HTTPException(context + " failed with 404: " + reason +
+							". Check that the configured API is valid.");
+	}
+
 	if (code == -1) {
-		LLM_LOG( context + " failed! Connection error: " + reason + "\n");
+		throw HTTPException(context + " failed! Connection error: " + reason + ". Check that the configured API is valid.");
 	} else {
 		LLM_LOG( context + " failed! HTTP " + std::to_string(code) + " (" +
 		        HTTPUtil::GetStatusMessage(HTTPUtil::ToStatusCode(code)) + "): " + reason + "\n");

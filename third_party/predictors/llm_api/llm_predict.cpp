@@ -575,7 +575,6 @@ void LlmApiPredictor::PredictJoin(ClientContext &client, DataChunk &input, DataC
 		total_in = completion["usage"]["prompt_tokens"].get<int>();
 		total_out = completion["usage"]["completion_tokens"].get<int>();
 	}
-	std::cout << "PredictJoin - tokens: " + std::to_string(total_tokens) + "\n";
 
 #if OPT_TIMING
 	const steady_clock::time_point end = steady_clock::now();

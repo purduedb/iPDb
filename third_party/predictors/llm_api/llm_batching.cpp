@@ -183,24 +183,25 @@ std::unique_ptr<BatchResult> LlmApiPredictor::PredictOne(OpenAI &api, const stri
 	LLM_LOG("Request time (s):" + std::to_string(req_time) + "\n");
 	if (completion.contains("error")) {
 		CheckApiError(completion, "LLM call");
-		result->outputs.emplace_back("");
-	}
-	total_time += req_time;
-	tokens += completion["usage"]["total_tokens"].get<int>();
-	in_tokens += completion["usage"]["prompt_tokens"].get<int>();
-	out_tokens += completion["usage"]["completion_tokens"].get<int>();
+		result->outputs.emplace_back("{}");
+	} else {
+		total_time += req_time;
+		tokens += completion["usage"]["total_tokens"].get<int>();
+		in_tokens += completion["usage"]["prompt_tokens"].get<int>();
+		out_tokens += completion["usage"]["completion_tokens"].get<int>();
 
-	const auto llm_out = ExtractContent(completion);
-	if (!llm_out.empty()) {
-		LLM_LOG("Row No: " + std::to_string(row) + "\n" + llm_out + "||\n");
-		result->outputs.push_back(llm_out);
-		result->tokens = tokens;
-		result->in_tokens = in_tokens;
-		result->out_tokens = out_tokens;
-		result->time = total_time;
-		result->is_concat = false;
-		result->n_calls = 1;
-		return std::move(result);
+		const auto llm_out = ExtractContent(completion);
+		if (!llm_out.empty()) {
+			LLM_LOG("Row No: " + std::to_string(row) + "\n" + llm_out + "||\n");
+			result->outputs.push_back(llm_out);
+			result->tokens = tokens;
+			result->in_tokens = in_tokens;
+			result->out_tokens = out_tokens;
+			result->time = total_time;
+			result->is_concat = false;
+			result->n_calls = 1;
+			return std::move(result);
+		}
 	}
 
 	LLM_LOG("Single call failed, row: " << row << "\n");
