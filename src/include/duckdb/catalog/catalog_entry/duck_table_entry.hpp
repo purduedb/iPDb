@@ -14,6 +14,8 @@
 
 namespace duckdb {
 
+class CommitDropState;
+
 struct AddConstraintInfo;
 
 //! A table catalog entry
@@ -34,6 +36,7 @@ public:
 	DataTable &GetStorage() override;
 
 	//! Get statistics of a column (physical or virtual) within the table
+	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, const StorageIndex &storage_index);
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 
 	unique_ptr<BlockingSample> GetSample() override;
@@ -42,12 +45,12 @@ public:
 
 	void SetAsRoot() override;
 
-	void CommitAlter(string &column_name);
-	void CommitDrop();
+	void CommitAlter(string &column_name, CommitDropState &drop_state);
+	void CommitDrop(CommitDropState &drop_state);
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 
-	vector<ColumnSegmentInfo> GetColumnSegmentInfo() override;
+	vector<ColumnSegmentInfo> GetColumnSegmentInfo(const QueryContext &context) override;
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 

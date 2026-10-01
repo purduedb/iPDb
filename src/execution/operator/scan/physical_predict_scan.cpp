@@ -90,7 +90,7 @@ unique_ptr<GlobalSourceState> PhysicalPredictScan::GetGlobalSourceState(ClientCo
 	return make_uniq<PredictScanGlobalState>(context, std::move(p), std::move(stats));
 }
 
-SourceResultType PhysicalPredictScan::GetData(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalPredictScan::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                               OperatorSourceInput &input) const {
 	auto &g_state = input.global_state.Cast<PredictScanGlobalState>();
 

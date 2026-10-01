@@ -528,7 +528,7 @@ void TextTreeRenderer::SplitUpExtraInfo(const InsertionOrderPreservingMap<string
 					result.emplace_back();
 				}
 			}
-			break;
+			continue;
 		}
 		if (item.first == RenderTreeNode::ESTIMATED_CARDINALITY) {
 			// estimated cardinality - reserve space for estimate
@@ -538,7 +538,7 @@ void TextTreeRenderer::SplitUpExtraInfo(const InsertionOrderPreservingMap<string
 				continue;
 			}
 			result.emplace_back();
-			break;
+			continue;
 		}
 		auto splits = StringUtil::Split(str, "\n");
 		if (splits.size() > max_lines) {

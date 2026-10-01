@@ -8,7 +8,7 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
-SourceResultType PhysicalCreateModel::GetData(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalCreateModel::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                               OperatorSourceInput &input) const {
 	if (!info->secret.empty()) {
 		auto &secret_manager = SecretManager::Get(context.client);

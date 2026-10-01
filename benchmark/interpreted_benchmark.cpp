@@ -11,6 +11,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 
 #include <fstream>
 #include <sstream>
@@ -158,6 +159,15 @@ static void ThrowResultModeError(BenchmarkFileReader &reader) {
 	throw std::runtime_error(reader.FormatException(error));
 }
 
+void InterpretedBenchmark::AddExtension(const string &extension, bool load_only) {
+	auto &map = load_only ? load_extensions_map : extensions_map;
+	auto it = map.find(extension);
+	if (it != map.end()) {
+		return;
+	}
+	map.insert(extension, map.size());
+}
+
 void InterpretedBenchmark::ProcessFile(const string &path) {
 	BenchmarkFileReader reader(path, replacement_mapping);
 	string line;
@@ -212,9 +222,9 @@ void InterpretedBenchmark::ProcessFile(const string &path) {
 					throw std::runtime_error(
 					    reader.FormatException("require only supports load_only as a second parameter"));
 				}
-				load_extensions.insert(splits[1]);
+				AddExtension(splits[1], true);
 			} else {
-				extensions.insert(splits[1]);
+				AddExtension(splits[1], false);
 			}
 		} else if (splits[0] == "resultmode") {
 			if (splits.size() < 2) {
@@ -478,8 +488,10 @@ void InterpretedBenchmark::LoadBenchmark() {
 	is_loaded = true;
 }
 
-void LoadExtensions(InterpretedBenchmarkState &state, const std::unordered_set<string> &extensions_to_load) {
-	for (auto &extension : extensions_to_load) {
+void InterpretedBenchmark::LoadExtensions(InterpretedBenchmarkState &state, bool is_load_set) {
+	auto &map = is_load_set ? load_extensions_map : extensions_map;
+	for (auto &it : map) {
+		auto &extension = it.first;
 		auto result = ExtensionHelper::LoadExtension(state.db, extension);
 		if (result == ExtensionLoadResult::EXTENSION_UNKNOWN) {
 			throw InvalidInputException("Unknown extension " + extension);
@@ -491,7 +503,7 @@ void LoadExtensions(InterpretedBenchmarkState &state, const std::unordered_set<s
 }
 
 unique_ptr<QueryResult> InterpretedBenchmark::RunLoadQuery(InterpretedBenchmarkState &state, const string &load_query) {
-	LoadExtensions(state, load_extensions);
+	LoadExtensions(state, true);
 	auto result = state.con.Query(load_query);
 	for (idx_t i = 0; i < retry_load; i++) {
 		if (!result->HasError()) {
@@ -516,10 +528,10 @@ unique_ptr<BenchmarkState> InterpretedBenchmark::Initialize(BenchmarkConfigurati
 		state = make_uniq<InterpretedBenchmarkState>(full_db_path, storage_version);
 	}
 	state->calc_acc = config.calc_acc;
-	extensions.insert("core_functions");
-	extensions.insert("parquet");
+	AddExtension("core_functions", false);
+	AddExtension("parquet", false);
 
-	LoadExtensions(*state, extensions);
+	LoadExtensions(*state, false);
 	if (queries.find("init") != queries.end()) {
 		string init_query = queries["init"];
 		result = state->con.Query(init_query);
@@ -613,8 +625,8 @@ ScopedConfigSetting PrepareResultCollector(ClientConfig &config, InterpretedBenc
 		return ScopedConfigSetting(
 		    config,
 		    [&benchmark](ClientConfig &config) {
-			    config.get_result_collector = [&benchmark](ClientContext &context,
-			                                               PreparedStatementData &data) -> PhysicalOperator & {
+			    config.get_result_collector =
+			        [&benchmark](ClientContext &context, PreparedStatementData &data) -> unique_ptr<PhysicalOperator> {
 				    return PhysicalArrowCollector::Create(context, data, benchmark.ArrowBatchSize());
 			    };
 		    },

@@ -94,7 +94,7 @@ unique_ptr<GlobalSourceState> PhysicalGNNPredict::GetGlobalSourceState(ClientCon
 	return make_uniq<PredictGNNSourceState>();
 }
 
-SourceResultType PhysicalGNNPredict::GetData(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalGNNPredict::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                              OperatorSourceInput &input) const {
 #ifdef DEBUG
 	std::cout << "-------- GNNPredict GetData()" << std::endl;

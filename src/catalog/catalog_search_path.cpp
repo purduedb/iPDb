@@ -8,10 +8,13 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database_manager.hpp"
 
+#include "duckdb/common/exception/parser_exception.hpp"
+
 namespace duckdb {
 
-CatalogSearchEntry::CatalogSearchEntry(string catalog_p, string schema_p)
-    : catalog(std::move(catalog_p)), schema(std::move(schema_p)) {
+CatalogSearchEntry::CatalogSearchEntry(string catalog_p, string schema_p, bool default_schema_precedence_p)
+    : catalog(std::move(catalog_p)), schema(std::move(schema_p)),
+      default_schema_precedence(default_schema_precedence_p) {
 }
 
 string CatalogSearchEntry::ToString() const {
@@ -195,8 +198,15 @@ void CatalogSearchPath::Set(CatalogSearchEntry new_value, CatalogSetPathType set
 	Set(std::move(new_paths), set_type);
 }
 
-const vector<CatalogSearchEntry> &CatalogSearchPath::Get() const {
-	return paths;
+vector<CatalogSearchEntry> CatalogSearchPath::Get() const {
+	vector<CatalogSearchEntry> res;
+	for (auto &path : paths) {
+		if (path.schema.empty()) {
+			continue;
+		}
+		res.emplace_back(path);
+	}
+	return res;
 }
 
 string CatalogSearchPath::GetDefaultSchema(const string &catalog) const {
@@ -248,7 +258,7 @@ vector<string> CatalogSearchPath::GetCatalogsForSchema(const string &schema) con
 		catalogs.push_back(SYSTEM_CATALOG);
 	} else {
 		for (auto &path : paths) {
-			if (StringUtil::CIEquals(path.schema, schema)) {
+			if (StringUtil::CIEquals(path.schema, schema) || path.schema.empty()) {
 				catalogs.push_back(path.catalog);
 			}
 		}
@@ -259,16 +269,47 @@ vector<string> CatalogSearchPath::GetCatalogsForSchema(const string &schema) con
 vector<string> CatalogSearchPath::GetSchemasForCatalog(const string &catalog) const {
 	vector<string> schemas;
 	for (auto &path : paths) {
-		if (StringUtil::CIEquals(path.catalog, catalog)) {
+		if (!path.schema.empty() && StringUtil::CIEquals(path.catalog, catalog)) {
 			schemas.push_back(path.schema);
 		}
 	}
 	return schemas;
 }
 
+vector<CatalogSearchEntry> CatalogSearchPath::GetImplicitSearchCatalogs() const {
+	// Get the implicit entries that were not already resolved by the precedence flag.
+	vector<CatalogSearchEntry> catalogs;
+	for (auto &path : paths) {
+		if (path.schema.empty() && !path.catalog.empty() && !path.default_schema_precedence) {
+			catalogs.push_back(path);
+		}
+	}
+	return catalogs;
+}
+
+vector<CatalogSearchEntry> CatalogSearchPath::GetWithPrecedenceSchemas(ClientContext &context) const {
+	vector<CatalogSearchEntry> res;
+	for (auto &path : paths) {
+		// Resolve implicit entries with default_schema_precedence to the catalog's default schema.
+		if (path.schema.empty()) {
+			if (path.catalog.empty() || !path.default_schema_precedence) {
+				continue;
+			}
+			auto catalog_entry = Catalog::GetCatalogEntry(context, path.catalog);
+			if (!catalog_entry) {
+				continue;
+			}
+			res.emplace_back(path.catalog, catalog_entry->GetDefaultSchema());
+		} else {
+			res.emplace_back(path);
+		}
+	}
+	return res;
+}
+
 const CatalogSearchEntry &CatalogSearchPath::GetDefault() const {
-	const auto &paths = Get();
 	D_ASSERT(paths.size() >= 2);
+	D_ASSERT(!paths[1].schema.empty());
 	return paths[1];
 }
 
@@ -276,7 +317,7 @@ void CatalogSearchPath::SetPathsInternal(vector<CatalogSearchEntry> new_paths) {
 	this->set_paths = std::move(new_paths);
 
 	paths.clear();
-	paths.reserve(set_paths.size() + 3);
+	paths.reserve(set_paths.size() + 4);
 	paths.emplace_back(TEMP_CATALOG, DEFAULT_SCHEMA);
 	for (auto &path : set_paths) {
 		paths.push_back(path);

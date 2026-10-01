@@ -4,9 +4,8 @@ if (WIN32)
 else ()
     set(STATIC_LINK_SQLITE "")
 endif()
-
 duckdb_extension_load(sqlite_scanner
         ${STATIC_LINK_SQLITE} LOAD_TESTS
         GIT_URL https://github.com/duckdb/duckdb-sqlite
-        GIT_TAG 0c93d610af1e1f66292559fcf0f01a93597a98b6
+        GIT_TAG f79b1db7d7730b18d0f8400d3650ffa6b45168d8
         )

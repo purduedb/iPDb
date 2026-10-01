@@ -10,10 +10,7 @@
 
 #include "duckdb/common/enums/index_constraint_type.hpp"
 #include "duckdb/common/types/constraint_conflict_info.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/unordered_set.hpp"
-#include "duckdb/parser/parsed_expression.hpp"
-#include "duckdb/planner/expression.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
 namespace duckdb {
@@ -89,8 +86,7 @@ public:
 		return column_id_set;
 	}
 
-	// All indexes can be dropped, even if they are unbound
-	virtual void CommitDrop() = 0;
+	virtual void ResetStorage() = 0;
 
 public:
 	template <class TARGET>

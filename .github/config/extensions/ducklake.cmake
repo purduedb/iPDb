@@ -1,5 +1,4 @@
 duckdb_extension_load(ducklake
-    DONT_LINK
     GIT_URL https://github.com/duckdb/ducklake
-    GIT_TAG de813ff4d052bffe3e9e7ffcdc31d18ca38e5ecd
+    GIT_TAG d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4
 )

@@ -5,6 +5,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/tableref/bound_predictref.hpp"
 #include "duckdb/planner/model_selection.hpp"
+#include "duckdb/planner/operator/logical_predict.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 
@@ -14,8 +15,18 @@
 
 namespace duckdb {
 
-unique_ptr<BoundTableRef> Binder::BindBoundPredict(TablePredictRef &ref) {
-	auto result = make_uniq<BoundPredictRef>();
+BoundStatement Binder::Bind(TablePredictRef &ref) {
+	if (ref.source) {
+		// Wrap the source in a projection
+		auto subquery = make_uniq<SelectNode>();
+		subquery->select_list.push_back(make_uniq<StarExpression>());
+		subquery->from_table = std::move(ref.source);
+
+		auto subquery_select = make_uniq<SelectStatement>();
+		subquery_select->node = std::move(subquery);
+		ref.source = make_uniq<SubqueryRef>(std::move(subquery_select));
+	}
+
 	auto bound_predict = make_uniq<BoundPredictInfo>();
 	bound_predict->model_name = std::move(ref.model_name);
 
@@ -72,7 +83,9 @@ unique_ptr<BoundTableRef> Binder::BindBoundPredict(TablePredictRef &ref) {
 		}
 	}
 
-	result->bind_index = GenerateTableIndex();
+	auto bind_index = GenerateTableIndex();
+	shared_ptr<Binder> child_binder;
+	vector<unique_ptr<LogicalOperator>> children;
 
 	vector<string> names;
 	vector<LogicalType> input_types;
@@ -80,10 +93,10 @@ unique_ptr<BoundTableRef> Binder::BindBoundPredict(TablePredictRef &ref) {
 	case_insensitive_map_t<string> emb_sub;
 
 	if (ref.source) {
-		result->child_binder = CreateBinder(context, this);
-		result->children.push_back(result->child_binder->Bind(*ref.source));
+		child_binder = CreateBinder(context, this);
+		children.push_back(std::move(child_binder->Bind(*ref.source).plan));
 
-		result->child_binder->bind_context.GetTypesAndNames(names, input_types);
+		child_binder->bind_context.GetTypesAndNames(names, input_types);
 		types.insert(types.end(), input_types.begin(), input_types.end());
 
 		vector<idx_t> input_mask;
@@ -144,10 +157,10 @@ unique_ptr<BoundTableRef> Binder::BindBoundPredict(TablePredictRef &ref) {
 		if (bound_predict->model_type == ModelType::GNN) {
 			vector<string> opt_names;
 			vector<LogicalType> opt_types;
-			result->opt_binder = CreateBinder(context, this);
-			result->children.push_back(result->opt_binder->Bind(*ref.opt_source));
+			auto opt_binder = CreateBinder(context, this);
+			children.push_back(std::move(opt_binder->Bind(*ref.opt_source).plan));
 
-			result->opt_binder->bind_context.GetTypesAndNames(opt_names, opt_types);
+			opt_binder->bind_context.GetTypesAndNames(opt_names, opt_types);
 
 			vector<idx_t> opt_mask;
 			if (!stored_model_data.opt_set_names.empty()) {
@@ -206,31 +219,23 @@ unique_ptr<BoundTableRef> Binder::BindBoundPredict(TablePredictRef &ref) {
 	bound_predict->result_set_names = std::move(stored_model_data.out_names);
 	bound_predict->result_set_types = std::move(stored_model_data.out_types);
 
-	result->bound_predict = std::move(bound_predict);
 	auto subquery_alias = ref.alias.empty() ? "__unnamed_predict" : ref.alias;
-	bind_context.AddGenericBinding(result->bind_index, subquery_alias, names, types);
+	bind_context.AddGenericBinding(bind_index, subquery_alias, names, types);
 
 	if (ref.source) {
-		MoveCorrelatedExpressions(*result->child_binder);
-	}
-	return std::move(result);
-}
-
-unique_ptr<BoundTableRef> Binder::Bind(TablePredictRef &expr) {
-	if (expr.source) {
-		// Wrap the source in a projection
-		auto subquery = make_uniq<SelectNode>();
-		subquery->select_list.push_back(make_uniq<StarExpression>());
-		subquery->from_table = std::move(expr.source);
-
-		auto subquery_select = make_uniq<SelectStatement>();
-		subquery_select->node = std::move(subquery);
-		auto subquery_ref = make_uniq<SubqueryRef>(std::move(subquery_select));
-
-		expr.source = std::move(subquery_ref);
+		MoveCorrelatedExpressions(*child_binder);
 	}
 
-	return BindBoundPredict(expr);
+	auto predict = make_uniq<LogicalPredict>(bind_index, std::move(bound_predict));
+	for (auto &child : children) {
+		predict->AddChild(std::move(child));
+	}
+
+	BoundStatement result;
+	result.names = std::move(names);
+	result.types = std::move(types);
+	result.plan = std::move(predict);
+	return result;
 }
 
 } // namespace duckdb
