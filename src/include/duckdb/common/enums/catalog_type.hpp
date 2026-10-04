@@ -26,8 +26,10 @@ enum class CatalogType : uint8_t {
 	COLLATION_ENTRY = 7,
 	TYPE_ENTRY = 8,
 	DATABASE_ENTRY = 9,
-	MODEL_ENTRY = 10,
-	EMBEDDING_ENTRY = 11,
+	COORDINATE_SYSTEM_ENTRY = 10,
+	// iPDb entries - kept clear of the upstream range so upstream additions (e.g. COORDINATE_SYSTEM_ENTRY) do not collide
+	MODEL_ENTRY = 20,
+	EMBEDDING_ENTRY = 21,
 
 	// functions
 	TABLE_FUNCTION_ENTRY = 25,

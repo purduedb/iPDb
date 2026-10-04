@@ -59,11 +59,12 @@ public:
 	data_ptr_t dictionary_indices_ptr;
 	data_ptr_t string_lengths_ptr;
 
-	buffer_ptr<Vector> dictionary;
+	buffer_ptr<VectorChildBuffer> dictionary;
 	void *decoder = nullptr;
 	bool all_values_inlined = false;
 
 	unsafe_unique_array<bool> filter_result;
+	bool null_filter_result_initialized = false;
 };
 
 } // namespace dict_fsst

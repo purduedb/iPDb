@@ -40,6 +40,7 @@ struct CreateSequenceInfo;
 struct CreateModelInfo;
 struct CreateEmbeddingInfo;
 struct CreateCollationInfo;
+struct CreateCoordinateSystemInfo;
 struct CreateIndexInfo;
 struct CreateTypeInfo;
 struct CreateTableInfo;
@@ -181,6 +182,11 @@ public:
 	//! Creates a collation in the catalog
 	DUCKDB_API optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction transaction, CreateCollationInfo &info);
 	DUCKDB_API optional_ptr<CatalogEntry> CreateCollation(ClientContext &context, CreateCollationInfo &info);
+	//! Creates a coordinate system in the catalog
+	DUCKDB_API optional_ptr<CatalogEntry> CreateCoordinateSystem(CatalogTransaction transaction,
+	                                                             CreateCoordinateSystemInfo &info);
+	DUCKDB_API optional_ptr<CatalogEntry> CreateCoordinateSystem(ClientContext &context,
+	                                                             CreateCoordinateSystemInfo &info);
 	//! Creates an index in the catalog
 	DUCKDB_API optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info);
 	DUCKDB_API optional_ptr<CatalogEntry> CreateIndex(ClientContext &context, CreateIndexInfo &info);
@@ -216,8 +222,12 @@ public:
 	DUCKDB_API optional_ptr<CatalogEntry> CreateType(CatalogTransaction transaction, SchemaCatalogEntry &schema,
 	                                                 CreateTypeInfo &info);
 	//! Creates a collation in the catalog
-	DUCKDB_API optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction transaction, SchemaCatalogEntry &schema,
-	                                                      CreateCollationInfo &info);
+	DUCKDB_API static optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction transaction,
+	                                                             SchemaCatalogEntry &schema, CreateCollationInfo &info);
+	//! Creates a coordinate system in the catalog
+	DUCKDB_API static optional_ptr<CatalogEntry> CreateCoordinateSystem(CatalogTransaction transaction,
+	                                                                    SchemaCatalogEntry &schema,
+	                                                                    CreateCoordinateSystemInfo &info);
 
 	//! Drops an entry from the catalog
 	DUCKDB_API void DropEntry(ClientContext &context, DropInfo &info);
@@ -342,6 +352,7 @@ public:
 	virtual string GetEncryptionCipher() const {
 		return string();
 	}
+	virtual ErrorData SupportsCreateTable(BoundCreateTableInfo &info);
 
 	//! Whether or not this catalog should search a specific type with the standard priority
 	DUCKDB_API virtual CatalogLookupBehavior CatalogTypeLookupRule(CatalogType type) const {
@@ -424,15 +435,15 @@ public:
 
 private:
 	//! Lookup an entry in the schema, returning a lookup with the entry and schema if they exist
-	CatalogEntryLookup TryLookupEntryInternal(CatalogTransaction transaction, const string &schema,
-	                                          const EntryLookupInfo &lookup_info);
+	virtual CatalogEntryLookup TryLookupEntryInternal(CatalogTransaction transaction, const string &schema,
+	                                                  const EntryLookupInfo &lookup_info);
 	//! Calls LookupEntryInternal on the schema, trying other schemas if the schema is invalid. Sets
 	//! CatalogEntryLookup->error depending on if_not_found when no entry is found
 	CatalogEntryLookup TryLookupEntry(CatalogEntryRetriever &retriever, const string &schema,
 	                                  const EntryLookupInfo &lookup_info, OnEntryNotFound if_not_found);
 	static CatalogEntryLookup TryLookupEntry(CatalogEntryRetriever &retriever, const vector<CatalogLookup> &lookups,
 	                                         const EntryLookupInfo &lookup_info, OnEntryNotFound if_not_found,
-	                                         bool allow_default_table_lookup);
+	                                         bool allow_default_lookup);
 	static CatalogEntryLookup TryLookupEntry(CatalogEntryRetriever &retriever, const string &catalog,
 	                                         const string &schema, const EntryLookupInfo &lookup_info,
 	                                         OnEntryNotFound if_not_found);
@@ -441,6 +452,10 @@ private:
 	static CatalogEntryLookup TryLookupDefaultTable(CatalogEntryRetriever &retriever,
 	                                                const EntryLookupInfo &lookup_info,
 	                                                bool allow_ignore_at_clause = false);
+
+	//! Looks for a non-table entry in the default schema of any implicit search catalog
+	static CatalogEntryLookup TryLookupDefaultSchema(CatalogEntryRetriever &retriever,
+	                                                 const EntryLookupInfo &lookup_info);
 
 	//! Return an exception with did-you-mean suggestion.
 	static CatalogException CreateMissingEntryException(CatalogEntryRetriever &retriever,

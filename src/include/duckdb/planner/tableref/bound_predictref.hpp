@@ -10,7 +10,8 @@
 
 #include "duckdb/common/enums/model_type.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/bound_tableref.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/types/value.hpp"
 
 namespace duckdb {
 
@@ -53,22 +54,4 @@ struct BoundPredictInfo {
 	static unique_ptr<BoundPredictInfo> Deserialize(Deserializer &deserializer);
 };
 
-class BoundPredictRef : public BoundTableRef {
-public:
-	static constexpr auto TYPE = TableReferenceType::PREDICT;
-
-public:
-	explicit BoundPredictRef() : BoundTableRef(TableReferenceType::PREDICT), bind_index(0) {
-	}
-
-	idx_t bind_index;
-	//! The binder used to bind the child of the predict
-	shared_ptr<Binder> child_binder;
-	//! The binder used to bind the optional child for predict
-	shared_ptr<Binder> opt_binder;
-	//! The child node of the Predict
-	vector<unique_ptr<BoundTableRef>> children;
-	//! The bound predict info
-	unique_ptr<BoundPredictInfo> bound_predict;
-};
 } // namespace duckdb

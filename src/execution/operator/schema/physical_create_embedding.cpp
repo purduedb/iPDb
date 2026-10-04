@@ -81,7 +81,7 @@ struct EmbeddingFillCallback : public ColumnFillCallback {
 };
 #endif
 
-SourceResultType PhysicalCreateEmbedding::GetData(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalCreateEmbedding::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                   OperatorSourceInput &input) const {
 	auto &client = context.client;
 	auto &catalog = Catalog::GetCatalog(client, info->catalog);

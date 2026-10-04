@@ -102,39 +102,39 @@ static unique_ptr<RenderTreeNode> CreateNode(const PipelineRenderNode &op) {
 static unique_ptr<RenderTreeNode> CreateNode(const ProfilingNode &op) {
 	auto &info = op.GetProfilingInfo();
 	InsertionOrderPreservingMap<string> extra_info;
-	if (info.Enabled(info.settings, MetricsType::EXTRA_INFO)) {
-		extra_info = op.GetProfilingInfo().extra_info;
+	if (info.Enabled(info.settings, MetricType::EXTRA_INFO)) {
+		extra_info = op.GetProfilingInfo().GetMetricValue<InsertionOrderPreservingMap<string>>(MetricType::EXTRA_INFO);
 	}
 
 	string node_name = "QUERY";
 	if (op.depth > 0) {
-		node_name = info.GetMetricAsString(MetricsType::OPERATOR_TYPE);
+		node_name = info.GetMetricAsString(MetricType::OPERATOR_TYPE);
 	}
 
 	auto result = make_uniq<RenderTreeNode>(node_name, extra_info);
-	if (info.Enabled(info.settings, MetricsType::OPERATOR_CARDINALITY)) {
-		auto cardinality = info.GetMetricAsString(MetricsType::OPERATOR_CARDINALITY);
+	if (info.Enabled(info.settings, MetricType::OPERATOR_CARDINALITY)) {
+		auto cardinality = info.GetMetricAsString(MetricType::OPERATOR_CARDINALITY);
 		result->extra_text[RenderTreeNode::CARDINALITY] = cardinality;
 	}
-	if (info.Enabled(info.settings, MetricsType::OPERATOR_TIMING)) {
-		auto value = info.metrics.at(MetricsType::OPERATOR_TIMING).GetValue<double>();
+	if (info.Enabled(info.settings, MetricType::OPERATOR_TIMING)) {
+		auto value = info.metrics.at(MetricType::OPERATOR_TIMING).GetValue<double>();
 		string timing = StringUtil::Format("%.2f", value);
 		result->extra_text[RenderTreeNode::TIMING] = timing + "s";
 	}
-	if (info.Enabled(info.settings, MetricsType::LLM_CALLS)) {
-		auto llm_calls = info.GetMetricAsString(MetricsType::LLM_CALLS);
+	if (info.Enabled(info.settings, MetricType::LLM_CALLS)) {
+		auto llm_calls = info.GetMetricAsString(MetricType::LLM_CALLS);
 		result->extra_text[RenderTreeNode::LLM_CALLS] = llm_calls;
 	}
-	if (info.Enabled(info.settings, MetricsType::LLM_INPUTS)) {
-		auto llm_inputs = info.GetMetricAsString(MetricsType::LLM_INPUTS);
+	if (info.Enabled(info.settings, MetricType::LLM_INPUTS)) {
+		auto llm_inputs = info.GetMetricAsString(MetricType::LLM_INPUTS);
 		result->extra_text[RenderTreeNode::LLM_INPUTS] = llm_inputs;
 	}
-	if (info.Enabled(info.settings, MetricsType::LLM_OUTPUTS)) {
-		auto llm_outputs = info.GetMetricAsString(MetricsType::LLM_OUTPUTS);
+	if (info.Enabled(info.settings, MetricType::LLM_OUTPUTS)) {
+		auto llm_outputs = info.GetMetricAsString(MetricType::LLM_OUTPUTS);
 		result->extra_text[RenderTreeNode::LLM_OUTPUTS] = llm_outputs;
 	}
-	if (info.Enabled(info.settings, MetricsType::LLM_TOKENS)) {
-		auto llm_calls = info.GetMetricAsString(MetricsType::LLM_TOKENS);
+	if (info.Enabled(info.settings, MetricType::LLM_TOKENS)) {
+		auto llm_calls = info.GetMetricAsString(MetricType::LLM_TOKENS);
 		result->extra_text[RenderTreeNode::LLM_TOKENS] = llm_calls;
 	}
 	return result;
