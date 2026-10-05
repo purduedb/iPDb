@@ -24,7 +24,7 @@ Read the paper at [arxiv](https://arxiv.org/pdf/2601.16432).
 We publish prebuilt Linux CLI binaries for `amd64` and `arm64`, built with LLM OpenAI API support enabled (i.e., `ENABLE_PREDICT=1 ENABLE_LLM_API=1`), but without the native ONNX/llama.cpp backends. These are available at [Releases](https://github.com/purduedb/iPDb/releases) — look for `ipdb-cli-linux-<arch>.zip` (or `.gz`) for the CLI shell.
 
 ```bash
-curl -LO https://github.com/purduedb/iPDb/releases/download/v1.1.0/ipdb-cli-linux-amd64.zip
+curl -LO https://github.com/purduedb/iPDb/releases/download/v1.2.0/ipdb-cli-linux-amd64.zip
 unzip ipdb-cli-linux-amd64.zip
 chmod +x ipdb
 ./ipdb
