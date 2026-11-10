@@ -86,7 +86,7 @@ private:
 
 	static void CheckApiError(const nlohmann::json &completion, const string &context);
 	nlohmann::json BuildSingleResponseFormat() const;
-	nlohmann::json BuildArrayResponseFormat(idx_t n_rows = 0) const;
+	nlohmann::json BuildArrayResponseFormat() const;
 
 	std::vector<std::vector<float>> EmbedTexts(const std::vector<std::string> &texts) const;
 	static std::string ExtractContent(const nlohmann::json &completion);

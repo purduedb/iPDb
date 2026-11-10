@@ -3,6 +3,8 @@
 
 #include "duckdb/main/extension_helper.hpp"
 
+#include <atomic>
+#include <iostream>
 #include <string>
 #include <utility>
 
@@ -71,8 +73,11 @@ std::string LlmApiPredictor::ExtractContent(const nlohmann::json &completion) {
 
 void LlmApiPredictor::CheckApiError(const nlohmann::json &completion, const string &context) {
 	const int code = completion.contains("code") ? completion["code"].get<int>() : -1;
-	const string reason =
+	string reason =
 	    completion.contains("error") && completion["error"].is_string() ? completion["error"].get<string>() : "unknown error";
+	if (completion.contains("body") && completion["body"].is_string() && !completion["body"].get<string>().empty()) {
+		reason += " | " + completion["body"].get<string>();
+	}
 
 	if (code == static_cast<int>(HTTPStatusCode::Unauthorized_401)) {
 		throw HTTPException(context + " failed with 401: " + reason +
@@ -91,6 +96,14 @@ void LlmApiPredictor::CheckApiError(const nlohmann::json &completion, const stri
 		        HTTPUtil::GetStatusMessage(HTTPUtil::ToStatusCode(code)) + "): " + reason + "\n");
 		if (code == static_cast<int>(HTTPStatusCode::TooManyRequests_429)) {
 			LLM_LOG( "Rate limited by the API - consider lowering req_per_min or batch_size.\n");
+		} else if (code >= 400 && code < 500) {
+			// A 4xx other than 429 means the request itself is rejected, so every retry fails the same way and
+			// the caller degrades to per-row calls. LLM_LOG is compiled out of release builds; report it once.
+			static std::atomic<bool> reported {false};
+			if (!reported.exchange(true)) {
+				std::cerr << context << " rejected by the API (HTTP " << code << "): " << reason
+				          << "\nFalling back to per-row calls; further errors of this kind are not printed.\n";
+			}
 		}
 	}
 }

@@ -116,6 +116,9 @@ public:
 			Json out {};
 			out["error"] = response->reason;
 			out["code"] = response->status;
+			// Keep the provider's error body (e.g. a 400 naming the unsupported schema keyword); it is the
+			// only place the actual cause is reported.
+			out["body"] = post_request.buffer_out;
 			return out;
 		}
 

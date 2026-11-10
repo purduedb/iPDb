@@ -96,16 +96,16 @@ nlohmann::json LlmApiPredictor::BuildSingleResponseFormat() const {
 #endif
 }
 
-// When n_rows > 0, adds minItems/maxItems constraints to the array schema.
-nlohmann::json LlmApiPredictor::BuildArrayResponseFormat(const idx_t n_rows) const {
+// Keep this schema inside the subset every OpenAI-compatible provider accepts: no non-standard keywords
+// (e.g. a nested "strict") and no minItems/maxItems > 1 -- Anthropic rejects both with HTTP 400, which
+// silently turned every batch into per-row calls. The expected row count is stated in the user prompt
+// and checked when the response is parsed.
+nlohmann::json LlmApiPredictor::BuildArrayResponseFormat() const {
 #if IS_SCHEMA
 	std::stringstream sch;
 	sch << "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"json_response\",\"strict\":true,";
 	sch << "\"schema\":{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"output_array\"],";
-	sch << "\"strict\":false,\"properties\":{\"output_array\":{\"type\":\"array\"";
-	if (n_rows > 0) {
-		sch << ",\"minItems\":" << n_rows << ",\"maxItems\":" << n_rows;
-	}
+	sch << "\"properties\":{\"output_array\":{\"type\":\"array\"";
 	sch << ",\"items\":" << this->grammar << "}}}}}";
 	return PromptUtil::parse_json(sch.str());
 #else

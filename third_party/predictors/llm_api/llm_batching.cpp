@@ -47,7 +47,7 @@ std::unique_ptr<BatchResult> LlmApiPredictor::PredictBatch(OpenAI &api, const ve
 		// request["temperature"] = 0.5;
 		request["messages"] = {{{"content", GenerateSystemMessage(true)}, {"role", "system"}},
 		                       {{"content", rewritten}, {"role", "user"}}};
-		request["response_format"] = BuildArrayResponseFormat(num_rows);
+		request["response_format"] = BuildArrayResponseFormat();
 
 		auto req_ts = steady_clock::now();
 		auto completion = api.post("chat/completions", request);
