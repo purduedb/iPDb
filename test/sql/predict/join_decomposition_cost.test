@@ -1,0 +1,170 @@
+# name: test/sql/predict/join_decomposition_cost.test
+# description: Join decomposition is chosen at plan time (T1: cost comparison) and can be controlled by the user
+#              (T3: join_decomposition / join_decomposition_min_speedup / join_decomposition_selectivity settings and
+#              the per-model OPTIONS {"join_decomposition": '...'} override). The decision is shown in EXPLAIN as
+#              "[decomp: ...]". No LLM API is needed: when decomposition is chosen, the planning call goes to an
+#              unreachable endpoint, fails, and the original (pairwise) join is kept ("no usable rewrite").
+# group: [predict]
+
+# --- settings ---
+
+query I
+SELECT current_setting('join_decomposition');
+----
+auto
+
+statement ok
+SET join_decomposition = 'NEVER';
+
+query I
+SELECT current_setting('join_decomposition');
+----
+never
+
+statement ok
+SET join_decomposition = 'off';
+
+query I
+SELECT current_setting('join_decomposition');
+----
+never
+
+statement error
+SET join_decomposition = 'sometimes';
+----
+Unrecognized join decomposition mode
+
+statement error
+SET join_decomposition_min_speedup = 0;
+----
+must be positive
+
+statement error
+SET join_decomposition_selectivity = 0;
+----
+must be in (0, 1]
+
+statement error
+SET join_decomposition_selectivity = 1.5;
+----
+must be in (0, 1]
+
+statement ok
+RESET join_decomposition;
+
+query III
+SELECT current_setting('join_decomposition'), current_setting('join_decomposition_min_speedup'),
+       current_setting('join_decomposition_selectivity');
+----
+auto	2.0	0.1
+
+# --- setup ---
+
+statement ok
+CREATE LLM MODEL m PATH 'dummy-model' ON PROMPT API 'http://127.0.0.1:9/v1/';
+
+statement ok
+CREATE LLM MODEL m_never PATH 'dummy-model' ON PROMPT API 'http://127.0.0.1:9/v1/' OPTIONS {"join_decomposition": 'never'};
+
+statement ok
+CREATE TABLE cpu4 AS SELECT 'cpu ' || i AS name FROM range(4) t(i);
+
+statement ok
+CREATE TABLE board4 AS SELECT 'board ' || i AS name FROM range(4) t(i);
+
+statement ok
+CREATE TABLE cpu256 AS SELECT 'cpu ' || i AS name FROM range(256) t(i);
+
+statement ok
+CREATE TABLE board256 AS SELECT 'board ' || i AS name FROM range(256) t(i);
+
+# --- never: pairwise, no planning call ---
+
+statement ok
+SET join_decomposition = 'never';
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu256 c, board256 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*compatible \(pred\. \[join, 1 left\]\) \[decomp: never\].*
+
+statement ok
+RESET join_decomposition;
+
+# --- auto: pairwise is cheaper on tiny inputs (16 pairs < 2 x (10 + 4 + 4)) ---
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu4 c, board4 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*\[decomp: auto, pairwise 16 < 2x decomposed 18\].*
+
+# --- auto: decomposition is cheaper on 256 x 256 (65536 pairs); the planning call fails, so the pairwise join stays ---
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu256 c, board256 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*\[decomp: auto, pairwise 65536 >= 2x decomposed 522, no usable rewrite\].*
+
+# --- auto under LIMIT: pairwise stops after ~k/s pairs (5 / 0.01 = 500 < 2 x 522) ---
+
+statement ok
+SET join_decomposition_selectivity = 0.01;
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu256 c, board256 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}' LIMIT 5;
+----
+physical_plan	<REGEX>:.*\[decomp: auto, pairwise 500 < 2x decomposed 522\].*
+
+# a smaller margin makes the same plan decompose (500 >= 0.9 x 522)
+
+statement ok
+SET join_decomposition_min_speedup = 0.9;
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu256 c, board256 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}' LIMIT 5;
+----
+physical_plan	<REGEX>:.*\[decomp: auto, pairwise 500 >= 0\.9x decomposed 522, no usable rewrite\].*
+
+statement ok
+RESET join_decomposition_min_speedup;
+
+statement ok
+RESET join_decomposition_selectivity;
+
+# --- always: decompose even when pairwise is cheaper ---
+
+statement ok
+SET join_decomposition = 'always';
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu4 c, board4 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*\[decomp: always, no usable rewrite\].*
+
+# --- the per-model option overrides the session setting ---
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu256 c, board256 b
+WHERE LLM m_never PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*\[decomp: never\].*
+
+statement ok
+RESET join_decomposition;
+
+# --- the optimizer can still be disabled entirely: no decision is recorded ---
+
+statement ok
+SET disabled_optimizers = 'join_decomposition';
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM cpu256 c, board256 b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<!REGEX>:.*decomp:.*

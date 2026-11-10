@@ -10,6 +10,7 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/model_select_strategy.hpp"
+#include "duckdb/common/enums/join_decomposition_mode.hpp"
 #include "duckdb/common/enums/output_type.hpp"
 #include "duckdb/common/enums/profiler_format.hpp"
 #include "duckdb/common/progress_bar/progress_bar.hpp"
@@ -128,6 +129,13 @@ struct ClientConfig {
 	bool llm_use_batch = true;
 	bool llm_use_cache = true;
 	bool pull_predict_filter = true;
+
+	//! Whether LLM join predicates are decomposed into per-side extractions (auto = cost-based)
+	JoinDecompositionMode join_decomposition = JoinDecompositionMode::AUTO;
+	//! AUTO mode: decompose only if est. pairwise cost >= this factor x est. decomposed cost
+	double join_decomposition_min_speedup = 2.0;
+	//! AUTO mode: assumed selectivity of an LLM join predicate (under LIMIT k, pairwise stops after ~k/s pairs)
+	double join_decomposition_selectivity = 0.1;
 
 	//! Max fixed token size for the output of the LLM tokenizer
 	idx_t llm_max_tokens = 512;

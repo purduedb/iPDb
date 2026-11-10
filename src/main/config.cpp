@@ -158,6 +158,9 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(IndexScanMaxCountSetting),
     DUCKDB_SETTING_CALLBACK(IndexScanPercentageSetting),
     DUCKDB_SETTING(IntegerDivisionSetting),
+    DUCKDB_LOCAL(JoinDecompositionSetting),
+    DUCKDB_LOCAL(JoinDecompositionMinSpeedupSetting),
+    DUCKDB_LOCAL(JoinDecompositionSelectivitySetting),
     DUCKDB_SETTING_CALLBACK(LambdaSyntaxSetting),
     DUCKDB_SETTING(LateMaterializationMaxRowsSetting),
     DUCKDB_LOCAL(LlmMaxTokensSetting),
@@ -227,12 +230,12 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 
-static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 105),
+static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 108),
                                                      DUCKDB_SETTING_ALIAS("null_order", 43),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 135),
-                                                     DUCKDB_SETTING_ALIAS("user", 151),
+                                                     DUCKDB_SETTING_ALIAS("profiling_output", 138),
+                                                     DUCKDB_SETTING_ALIAS("user", 154),
                                                      DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 25),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 150),
+                                                     DUCKDB_SETTING_ALIAS("worker_threads", 153),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {

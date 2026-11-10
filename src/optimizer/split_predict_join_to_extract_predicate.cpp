@@ -2,6 +2,7 @@
 
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -302,9 +303,14 @@ static bool CallDecompositionLLM(Optimizer &optimizer, const BoundPredictInfo &p
 	};
 	request["response_format"] = response_schema;
 
-	auto completion = api->post("chat/completions", request);
-
+	// A failed or unparsable planning call keeps the original (pairwise) join instead of failing the query.
 	try {
+		auto completion = api->post("chat/completions", request);
+		if (completion.contains("error")) {
+			std::cout << "\n[SplitPredictJoin] Skipping rewrite, planning call failed: " << completion["error"].dump()
+			          << "\n" << std::endl;
+			return false;
+		}
 		std::string content = completion["choices"][0]["message"]["content"].get<std::string>();
 		auto parsed = Json::parse(PromptUtil::extract_json(content));
 		result.task1               = parsed["task1"].get<std::string>();
@@ -313,7 +319,9 @@ static bool CallDecompositionLLM(Optimizer &optimizer, const BoundPredictInfo &p
 		result.task2_output_column = parsed["task2_output_column"].get<std::string>();
 		result.predicate           = parsed["predicate"].get<std::string>();
 	} catch (const std::exception &e) {
-		throw InternalException("SplitPredictJoin: failed to parse decomposition response: %s", e.what());
+		std::cout << "\n[SplitPredictJoin] Skipping rewrite, unusable planning response: " << e.what() << "\n"
+		          << std::endl;
+		return false;
 	}
 
 	// Reject responses that do not follow iPDb PREDICT syntax rather than
@@ -365,6 +373,78 @@ static ExpressionType ParseComparisonOp(const std::string &pred) {
 	return ExpressionType::COMPARE_EQUAL;
 }
 
+// ---------------------------------------------------------------------------
+// T1: plan-time cost comparison between pairwise inference and decomposition.
+//
+// Costs are counted in "items" (input values sent to the LLM, a proxy for input tokens):
+//   pairwise   = P_eff                            P_eff = min(P, k / s) under LIMIT k, else P
+//   decomposed = c_rewrite + d_R + d_S
+// where P is the estimated number of row pairs reaching the predicate, d_R / d_S are the estimated number of
+// rows on each side of the join (an upper bound on the distinct inputs each extraction sees), s is the assumed
+// predicate selectivity (join_decomposition_selectivity), and c_rewrite is the planning call's cost in
+// item-equivalents. PredictJoin sends roughly one value per pair when the pairs come from a cross product
+// (one row of one side against a vector of the other), which is why a pair counts as one item.
+// We decompose iff pairwise >= min_speedup * decomposed (join_decomposition_min_speedup); the margin accounts
+// for the quality risk of the approximate rewrite.
+// ---------------------------------------------------------------------------
+static constexpr double DECOMPOSITION_REWRITE_COST = 10.0;
+
+struct DecompositionEstimate {
+	double pairs = 0;
+	double pairs_eff = 0;
+	double left = 0;
+	double right = 0;
+	double pairwise = 0;
+	double decomposed = 0;
+	bool decompose = false;
+};
+
+static double OperatorCardinality(ClientContext &context, LogicalOperator &op) {
+	auto cardinality = op.has_estimated_cardinality ? op.estimated_cardinality : op.EstimateCardinality(context);
+	return static_cast<double>(cardinality);
+}
+
+static DecompositionEstimate EstimateDecomposition(ClientContext &context, LogicalOperator &filter_child,
+                                                   int64_t limit, double selectivity, double min_speedup) {
+	DecompositionEstimate est;
+	// The filter's child is either the join or a projection directly on top of it (see CanOptimize).
+	LogicalOperator *join = &filter_child;
+	if (join->type == LogicalOperatorType::LOGICAL_PROJECTION && !join->children.empty()) {
+		join = join->children[0].get();
+	}
+	if (join->children.size() == 2) {
+		est.left = OperatorCardinality(context, *join->children[0]);
+		est.right = OperatorCardinality(context, *join->children[1]);
+	}
+	if (join->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || join->children.size() != 2) {
+		est.pairs = join->children.size() == 2 ? est.left * est.right : OperatorCardinality(context, *join);
+	} else {
+		est.pairs = OperatorCardinality(context, *join);
+	}
+	est.pairs_eff = est.pairs;
+	if (limit >= 0) {
+		est.pairs_eff = MinValue<double>(est.pairs, static_cast<double>(limit) / selectivity);
+	}
+	est.pairwise = est.pairs_eff;
+	est.decomposed = DECOMPOSITION_REWRITE_COST + est.left + est.right;
+	est.decompose = est.pairwise >= min_speedup * est.decomposed;
+	return est;
+}
+
+static string FormatCost(double value) {
+	return std::to_string(static_cast<int64_t>(value + 0.5));
+}
+
+static string DecompositionNote(const DecompositionEstimate &est, double min_speedup) {
+	auto speedup = std::to_string(min_speedup);
+	speedup.erase(speedup.find_last_not_of('0') + 1);
+	if (!speedup.empty() && speedup.back() == '.') {
+		speedup.pop_back();
+	}
+	return string("auto, pairwise ") + FormatCost(est.pairwise) + (est.decompose ? " >= " : " < ") + speedup +
+	       "x decomposed " + FormatCost(est.decomposed);
+}
+
 #endif // ENABLE_PREDICT && ENABLE_LLM_API
 
 // ===========================================================================
@@ -380,11 +460,8 @@ bool SplitPredictJoinToExtractPredicate::CanOptimize(LogicalOperator &op) {
 	if (op.type != LogicalOperatorType::LOGICAL_FILTER) {
 		return false;
 	}
-	// A limit propagated into the filter means a LIMIT operator sits above;
-	// skip the cross-join decomposition in that case.
-	if (op.Cast<LogicalFilter>().limit != -1) {
-		return false;
-	}
+	// A limit propagated into the filter (LIMIT above, pairwise inference stops early) is handled by the cost
+	// decision in TransformFilterJoin.
 	if (op.children.empty()) {
 		return false;
 	}
@@ -475,8 +552,42 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 	if (orig_inputs.size() < 2) {
 		return op;
 	}
+
+	// ------------------------------------------------------------------
+	// 1a. Decide whether to decompose (T1 + T3), before spending the
+	//     planning call. The session setting can be overridden per model
+	//     with OPTIONS {"join_decomposition": 'auto' | 'always' | 'never'}.
+	// ------------------------------------------------------------------
+	const auto &config = ClientConfig::GetConfig(optimizer.context);
+	auto mode = config.join_decomposition;
+	auto mode_option = orig_info.options.find("join_decomposition");
+	if (mode_option != orig_info.options.end()) {
+		mode = JoinDecompositionModeFromString(mode_option->second.ToString());
+	}
+	string decision_note;
+	switch (mode) {
+	case JoinDecompositionMode::NEVER:
+		orig_info.decomposition_note = "never";
+		return op;
+	case JoinDecompositionMode::ALWAYS:
+		decision_note = "always";
+		break;
+	case JoinDecompositionMode::AUTO: {
+		auto est = EstimateDecomposition(optimizer.context, join, filter.limit, config.join_decomposition_selectivity,
+		                                 config.join_decomposition_min_speedup);
+		decision_note = DecompositionNote(est, config.join_decomposition_min_speedup);
+		if (!est.decompose) {
+			orig_info.decomposition_note = decision_note;
+			return op;
+		}
+		break;
+	}
+	}
+
 	DecomposedPredict decomposed;
 	if (!CallDecompositionLLM(optimizer, orig_info, join, orig_inputs[0], orig_inputs[1], decomposed)) {
+		// The planning call failed or returned an invalid decomposition; keep the pairwise join.
+		orig_info.decomposition_note = decision_note + ", no usable rewrite";
 		return op;
 	}
 
@@ -523,6 +634,7 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		task1_info->result_set_types   = {decomposed.task1_output_type};
 		task1_info->input_set_names    = {orig_inputs[0]};
 		task1_info->options            = orig_info.options;
+		task1_info->decomposition_note = decision_note;
 
 		vector<unique_ptr<Expression>> task1_args;
 		task1_args.push_back(make_uniq<BoundColumnRefExpression>(
@@ -600,6 +712,9 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 
 		filter.expressions.clear();
 		filter.expressions.push_back(std::move(cmp));
+		// The filter no longer evaluates a PREDICT, so the early-stopping hint from
+		// LimitToPredictFilterPropagation does not apply; the LIMIT operator above still holds.
+		filter.limit = -1;
 	}
 
 	// ------------------------------------------------------------------

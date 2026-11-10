@@ -750,6 +750,27 @@
         "default_value": "false"
     },
     {
+        "name": "join_decomposition",
+        "description": "LLM join decomposition mode: auto (cost-based), always, or never",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "join_decomposition_min_speedup",
+        "description": "Decompose an LLM join only if est. pairwise cost >= this factor x est. decomposed cost (higher = safer)",
+        "type": "DOUBLE",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "join_decomposition_selectivity",
+        "description": "Assumed selectivity of an LLM join predicate, used to estimate pairwise cost under LIMIT",
+        "type": "DOUBLE",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
         "name": "lambda_syntax",
         "description": "Configures the use of the deprecated single arrow operator (->) for lambda functions.",
         "type": "ENUM<LambdaSyntax>",

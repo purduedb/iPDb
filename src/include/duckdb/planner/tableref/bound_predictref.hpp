@@ -51,6 +51,10 @@ struct BoundPredictInfo {
 	//! Per input (in the same order as input_set_names / the expression's children): true if the input belongs
 	//! to the left side of the join. Only meaningful when is_join is set.
 	vector<bool> join_left_inputs;
+	//! Outcome of the join-decomposition decision for this predicate (empty if none was made); shown in EXPLAIN.
+	//! On the original join predicate it explains why it was kept; on a decomposed extraction task it explains
+	//! why the rewrite was chosen.
+	string decomposition_note;
 
 	bool Equals(const BoundPredictInfo &other) const {
 		return model_type == other.model_type && model_name == other.model_name &&

@@ -1,0 +1,79 @@
+# name: test/sql/predict/predict_join_routing.test
+# description: A scalar BOOLEAN LLM predicate is evaluated as a join (PredictJoin) only when its inputs come from
+#              two or more distinct relations; otherwise it is evaluated per row (PredictChunk). Join mode is
+#              shown in EXPLAIN as "(pred. [join, <n> left])", so no LLM API is needed.
+# group: [predict]
+
+# keep the LLM-backed join decomposition from rewriting (and calling an API at optimization time)
+statement ok
+SET disabled_optimizers = 'join_decomposition';
+
+statement ok
+CREATE LLM MODEL m PATH 'dummy-model' ON PROMPT API 'http://127.0.0.1:9/v1/';
+
+statement ok
+CREATE TABLE product(product_name VARCHAR, standard_cost DOUBLE);
+
+statement ok
+CREATE TABLE board(product_name VARCHAR);
+
+# single table, two inputs, BOOLEAN output: per-row
+query II
+EXPLAIN (FORMAT json) SELECT product_name FROM product
+WHERE LLM m PROMPT 'has the {{standard_cost}} of {{product_name}} gone up or {gone_down BOOLEAN}';
+----
+physical_plan	<REGEX>:.*gone_down \(pred\.\).*
+
+query II
+EXPLAIN (FORMAT json) SELECT product_name FROM product
+WHERE LLM m PROMPT 'has the {{standard_cost}} of {{product_name}} gone up or {gone_down BOOLEAN}';
+----
+physical_plan	<!REGEX>:.*\[join.*
+
+# single table, two inputs, used in the SELECT list: per-row
+query II
+EXPLAIN (FORMAT json) SELECT LLM m PROMPT 'has the {{standard_cost}} of {{product_name}} gone up or {gone_down BOOLEAN}' FROM product;
+----
+physical_plan	<!REGEX>:.*\[join.*
+
+# self-join through two aliases of the same table: join
+query II
+EXPLAIN (FORMAT json) SELECT * FROM product p1, product p2
+WHERE LLM m PROMPT 'is {{p1.product_name}} {cheaper BOOL} than {{p2.product_name}}';
+----
+physical_plan	<REGEX>:.*cheaper \(pred\. \[join, 1 left\]\).*
+
+# two different tables: join
+query II
+EXPLAIN (FORMAT json) SELECT * FROM product p JOIN board b
+ON LLM m PROMPT 'is CPU {{p.product_name}} {compatible BOOLEAN} with motherboard {{b.product_name}}';
+----
+physical_plan	<REGEX>:.*compatible \(pred\. \[join, 1 left\]\).*
+
+# two left-table inputs + one right-table input: both left inputs go to the left side
+query II
+EXPLAIN (FORMAT json) SELECT * FROM product p, board b
+WHERE LLM m PROMPT 'is {{p.product_name}} at {{p.standard_cost}} {compatible BOOLEAN} with {{b.product_name}}';
+----
+physical_plan	<REGEX>:.*compatible \(pred\. \[join, 2 left\]\).*
+
+# the side of the first input is the left side, even if its columns are not adjacent
+query II
+EXPLAIN (FORMAT json) SELECT * FROM product p, board b
+WHERE LLM m PROMPT 'is {{b.product_name}} {compatible BOOLEAN} with {{p.product_name}} at {{p.standard_cost}}';
+----
+physical_plan	<REGEX>:.*compatible \(pred\. \[join, 1 left\]\).*
+
+# a join query whose predicate only uses one side: per-row
+query II
+EXPLAIN (FORMAT json) SELECT * FROM product p, board b
+WHERE LLM m PROMPT 'has the {{p.standard_cost}} of {{p.product_name}} gone up or {gone_down BOOLEAN}';
+----
+physical_plan	<!REGEX>:.*\[join.*
+
+# non-BOOLEAN output across two tables: per-row
+query II
+EXPLAIN (FORMAT json) SELECT LLM m PROMPT 'how compatible is {{p.product_name}} with {{b.product_name}} {score INTEGER}'
+FROM product p, board b;
+----
+physical_plan	<!REGEX>:.*\[join.*

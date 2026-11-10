@@ -1550,6 +1550,53 @@ Value LlmUseCacheSetting::GetSetting(const ClientContext &context) {
 }
 
 //===--------------------------------------------------------------------===//
+// Join Decomposition
+//===--------------------------------------------------------------------===//
+void JoinDecompositionSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).join_decomposition = JoinDecompositionModeFromString(input.ToString());
+}
+
+void JoinDecompositionSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition = ClientConfig().join_decomposition;
+}
+
+Value JoinDecompositionSetting::GetSetting(const ClientContext &context) {
+	return Value(JoinDecompositionModeToString(ClientConfig::GetConfig(context).join_decomposition));
+}
+
+void JoinDecompositionMinSpeedupSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (value <= 0) {
+		throw InvalidInputException("join_decomposition_min_speedup must be positive");
+	}
+	ClientConfig::GetConfig(context).join_decomposition_min_speedup = value;
+}
+
+void JoinDecompositionMinSpeedupSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_min_speedup = ClientConfig().join_decomposition_min_speedup;
+}
+
+Value JoinDecompositionMinSpeedupSetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).join_decomposition_min_speedup);
+}
+
+void JoinDecompositionSelectivitySetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (value <= 0 || value > 1) {
+		throw InvalidInputException("join_decomposition_selectivity must be in (0, 1]");
+	}
+	ClientConfig::GetConfig(context).join_decomposition_selectivity = value;
+}
+
+void JoinDecompositionSelectivitySetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_selectivity = ClientConfig().join_decomposition_selectivity;
+}
+
+Value JoinDecompositionSelectivitySetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).join_decomposition_selectivity);
+}
+
+//===--------------------------------------------------------------------===//
 // Pull Predict Filter
 //===--------------------------------------------------------------------===//
 void PullPredictFilterSetting::ResetLocal(ClientContext &context) {

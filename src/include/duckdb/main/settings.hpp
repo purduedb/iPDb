@@ -1106,6 +1106,39 @@ struct IntegerDivisionSetting {
 	static constexpr idx_t SettingIndex = 62;
 };
 
+struct JoinDecompositionSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "join_decomposition";
+	static constexpr const char *Description =
+	    "LLM join decomposition mode: auto (cost-based), always, or never";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct JoinDecompositionMinSpeedupSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "join_decomposition_min_speedup";
+	static constexpr const char *Description =
+	    "Decompose an LLM join only if est. pairwise cost >= this factor x est. decomposed cost (higher = safer)";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct JoinDecompositionSelectivitySetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "join_decomposition_selectivity";
+	static constexpr const char *Description =
+	    "Assumed selectivity of an LLM join predicate, used to estimate pairwise cost under LIMIT";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct LambdaSyntaxSetting {
 	using RETURN_TYPE = LambdaSyntax;
 	static constexpr const char *Name = "lambda_syntax";
