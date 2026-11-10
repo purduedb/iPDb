@@ -14,6 +14,10 @@
 
 #if defined(ENABLE_PREDICT) && defined(ENABLE_LLM_API)
 #include "openai.hpp"
+#include "duckdb/common/prompt.hpp"
+#include "duckdb/common/string_util.hpp"
+
+#include <regex>
 #endif
 
 namespace duckdb {
@@ -90,18 +94,125 @@ static void AppendTableSchemas(LogicalOperator &op, std::string &out) {
 struct DecomposedPredict {
 	std::string task1;
 	std::string task1_output_column;
+	LogicalType task1_output_type = LogicalType::VARCHAR;
 	std::string task2;
 	std::string task2_output_column;
+	LogicalType task2_output_type = LogicalType::VARCHAR;
 	std::string predicate;
 };
 
 // ---------------------------------------------------------------------------
+// Local helper: collect the `{{input}}` placeholders of a prompt, in order.
+// ---------------------------------------------------------------------------
+static vector<std::string> ExtractPromptInputs(const std::string &prompt) {
+	static const std::regex in_re(R"(\{\{([A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?)\}\})");
+	vector<std::string> inputs;
+	for (auto it = std::sregex_iterator(prompt.begin(), prompt.end(), in_re); it != std::sregex_iterator(); ++it) {
+		inputs.push_back((*it)[1].str());
+	}
+	return inputs;
+}
+
+// ---------------------------------------------------------------------------
+// Local helper: validate one decomposed task prompt against iPDb PREDICT
+// syntax. It must reference exactly the expected `{{input}}` placeholder and
+// declare exactly one `{<output_column> <TYPE>}` output whose name matches
+// `expected_output`. On success the declared type is written to `out_type`.
+// Returns an empty string on success, otherwise a description of the problem.
+// ---------------------------------------------------------------------------
+static std::string ValidateTaskPrompt(const std::string &prompt, const std::string &expected_input,
+                                      const std::string &expected_output, LogicalType &out_type) {
+	auto inputs = ExtractPromptInputs(prompt);
+	if (inputs.size() != 1 || !StringUtil::CIEquals(inputs[0], expected_input)) {
+		return "must reference exactly one input placeholder {{" + expected_input + "}}";
+	}
+	// Output declaration: `{name TYPE}` (single braces, not part of `{{...}}`).
+	static const std::regex out_re(R"((^|[^{])\{\s*([A-Za-z_][A-Za-z0-9_]*)\s+(INTEGER|VARCHAR|BOOLEAN|BOOL|DOUBLE)\s*\}(?!\}))",
+	                               std::regex_constants::icase);
+	idx_t n_outputs = 0;
+	std::string out_name;
+	std::string out_type_str;
+	for (auto it = std::sregex_iterator(prompt.begin(), prompt.end(), out_re); it != std::sregex_iterator(); ++it) {
+		out_name = (*it)[2].str();
+		out_type_str = StringUtil::Upper((*it)[3].str());
+		n_outputs++;
+	}
+	if (n_outputs != 1) {
+		return "must declare exactly one output as {<output_column> <TYPE>}";
+	}
+	if (out_name != expected_output) {
+		return "declared output column '" + out_name + "' does not match output column '" + expected_output + "'";
+	}
+	out_type = LogicalType(Prompt::type_to_logical_type(out_type_str));
+	return "";
+}
+
+// ---------------------------------------------------------------------------
+// Local helper: rename the `{old_name TYPE}` output declaration of a
+// (validated) task prompt to `{new_name TYPE}`, leaving `{{input}}` intact.
+// ---------------------------------------------------------------------------
+static void RenamePromptOutput(std::string &prompt, const std::string &old_name, const std::string &new_name) {
+	static const std::regex out_re(R"((^|[^{])\{(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s+(?:INTEGER|VARCHAR|BOOLEAN|BOOL|DOUBLE)\s*)\}(?!\}))",
+	                               std::regex_constants::icase);
+	std::smatch m;
+	auto begin = prompt.cbegin();
+	while (std::regex_search(begin, prompt.cend(), m, out_re)) {
+		if (m[3].str() == old_name) {
+			auto pos = static_cast<size_t>(m[3].first - prompt.cbegin());
+			prompt.replace(pos, old_name.size(), new_name);
+			return;
+		}
+		begin = m[0].second;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Local helper: derive a snake_case suffix from an input placeholder, using
+// its table qualifier (`a.review` -> `a`), or `fallback` if unqualified.
+// ---------------------------------------------------------------------------
+static std::string InputSuffix(const std::string &input, const std::string &fallback) {
+	auto dot = input.find('.');
+	if (dot == std::string::npos || dot == 0) {
+		return fallback;
+	}
+	return StringUtil::Lower(input.substr(0, dot));
+}
+
+// ---------------------------------------------------------------------------
+// Local helper: make sure the two sub-task output columns never contend for
+// the same name (e.g. both tasks extracting `sentiment`). Identifiers are
+// case-insensitive in DuckDB, so compare accordingly. On a clash both columns
+// are suffixed with their input's table alias (sentiment_a / sentiment_b),
+// falling back to positional suffixes, and the prompts are rewritten to match.
+// ---------------------------------------------------------------------------
+static void DisambiguateOutputColumns(DecomposedPredict &result, const std::string &task1_input,
+                                      const std::string &task2_input) {
+	if (!StringUtil::CIEquals(result.task1_output_column, result.task2_output_column)) {
+		return;
+	}
+	auto s1 = InputSuffix(task1_input, "1");
+	auto s2 = InputSuffix(task2_input, "2");
+	if (s1 == s2) {
+		s1 = "1";
+		s2 = "2";
+	}
+	auto new1 = result.task1_output_column + "_" + s1;
+	auto new2 = result.task2_output_column + "_" + s2;
+	RenamePromptOutput(result.task1, result.task1_output_column, new1);
+	RenamePromptOutput(result.task2, result.task2_output_column, new2);
+	result.task1_output_column = new1;
+	result.task2_output_column = new2;
+}
+
+// ---------------------------------------------------------------------------
 // Local helper: call the LLM to decompose a cross-join PREDICT into two
 // single-input extraction tasks plus a relational predicate.
+// Returns false (and leaves the plan untouched) if the response does not
+// conform to iPDb PREDICT syntax.
 // ---------------------------------------------------------------------------
-static DecomposedPredict CallDecompositionLLM(Optimizer &optimizer,
-                                              const BoundPredictInfo &predict_info,
-                                              LogicalOperator &join) {
+static bool CallDecompositionLLM(Optimizer &optimizer, const BoundPredictInfo &predict_info,
+                                 LogicalOperator &join, const std::string &task1_input,
+                                 const std::string &task2_input, DecomposedPredict &result) {
 	using Json = nlohmann::json;
 
 	auto &db = DatabaseInstance::GetDatabase(optimizer.context);
@@ -111,22 +222,59 @@ static DecomposedPredict CallDecompositionLLM(Optimizer &optimizer,
 	std::string schemas;
 	AppendTableSchemas(join, schemas);
 
-	// User message: ask the LLM to split the task.
-	std::string user_msg =
-	    "Convert the following task `" + predict_info.prompt +
-	    "` to two separate extraction tasks and a predicate.\n"
-	    " Extraction task is a prompt like above that takes a single input and produces an attribute"
-	    " that can be used to apply the predicate.\n"
-	    " Predicate should be a relational operation.\n"
-	    " Schemas: " + schemas;
-
-	// Fixed system message describing the semantic task template.
+	// Fixed system message describing iPDb semantic-task (PREDICT prompt) syntax.
 	std::string sys_msg =
-	    "You are a database optimizer with knowledge about semantic tasks.\n"
-	    " Semantic task template, `extract the {<output_column> VARCHAR} from {{input_column}}`,"
-	    " where <input_column> and <output_column> should be replaced appropriately.";
+	    "You are a database query optimizer for iPDb, a SQL engine with LLM-powered semantic predicates.\n"
+	    "Your job is to decompose a semantic predicate that compares two inputs (one from each side of a join)"
+	    " into two independent single-input extraction tasks plus a relational comparison, so that each"
+	    " extraction runs once per row of one table instead of once per row pair.\n"
+	    "\n"
+	    "iPDb semantic task (prompt) syntax -- follow it EXACTLY:\n"
+	    "- Inputs are referenced with double braces holding the fully qualified column name, e.g."
+	    " {{t.col}}. Copy the input placeholder verbatim from the original task.\n"
+	    "- The output is declared inline with single braces as {<output_column> <TYPE>}, where <TYPE> is one of"
+	    " BOOL, INTEGER, DOUBLE, VARCHAR. Exactly one output declaration per task.\n"
+	    "- <output_column> is a snake_case identifier ([a-z_][a-z0-9_]*) and must be identical to the"
+	    " corresponding *_output_column field.\n"
+	    "- Never describe the output space in prose (e.g. '(positive or negative)', 'yes/no', 'one of A, B, C')."
+	    " Instead encode it in the output column and type. Prefer BOOL for binary attributes"
+	    " (e.g. {is_positive BOOL}), INTEGER/DOUBLE for numeric attributes (e.g. {price DOUBLE}), and VARCHAR"
+	    " only for open-ended categorical values.\n"
+	    "- task1_output_column and task2_output_column MUST be different names, even when both tasks extract the"
+	    " same attribute: suffix the attribute with the input's table alias (e.g. sentiment_a and sentiment_b for"
+	    " {{a.review}} and {{b.review}}).\n"
+	    "- Use the same <TYPE> for both tasks, and phrase both tasks identically except for the input, so the"
+	    " two outputs are directly comparable.\n"
+	    "\n"
+	    "Predicate: one of the comparison operators =, !=, <, >, <=, >= applied as"
+	    " `task1_output_column <op> task2_output_column`. Choose the operator so that the comparison is true"
+	    " exactly when the original task's output would be true.\n"
+	    "\n"
+	    "Example 1\n"
+	    "Original task: Is the product {{a.description}} more expensive than {{b.description}}? {pricier BOOL}\n"
+	    "task1: Extract the price in USD of the product {{a.description}} {price_a DOUBLE}\n"
+	    "task1_output_column: price_a\n"
+	    "task2: Extract the price in USD of the product {{b.description}} {price_b DOUBLE}\n"
+	    "task2_output_column: price_b\n"
+	    "predicate: >\n"
+	    "\n"
+	    "Example 2\n"
+	    "Original task: Do {{p.abstract}} and {{q.abstract}} belong to the {same_field BOOL} research field?\n"
+	    "task1: Extract the research field of the paper {{p.abstract}} {field_p VARCHAR}\n"
+	    "task1_output_column: field_p\n"
+	    "task2: Extract the research field of the paper {{q.abstract}} {field_q VARCHAR}\n"
+	    "task2_output_column: field_q\n"
+	    "predicate: =";
 
-	// Response schema requiring exactly the five fields.
+	// User message: the concrete task to split.
+	std::string user_msg =
+	    "Original task: " + predict_info.prompt + "\n"
+	    "task1 must use exactly the input {{" + task1_input + "}} and nothing else.\n"
+	    "task2 must use exactly the input {{" + task2_input + "}} and nothing else.\n"
+	    "Schemas: " + schemas;
+
+	// Response schema requiring exactly the five fields; predicate is constrained
+	// to a single comparison operator.
 	Json response_schema;
 	response_schema["type"] = "json_schema";
 	response_schema["json_schema"] = {
@@ -141,7 +289,7 @@ static DecomposedPredict CallDecompositionLLM(Optimizer &optimizer,
 	            {"task1_output_column",  {{"type", "string"}}},
 	            {"task2",                {{"type", "string"}}},
 	            {"task2_output_column",  {{"type", "string"}}},
-	            {"predicate",            {{"type", "string"}}}
+	            {"predicate",            {{"type", "string"}, {"enum", {"=", "!=", "<", ">", "<=", ">="}}}}
 	        }}
 	    }}
 	};
@@ -156,7 +304,6 @@ static DecomposedPredict CallDecompositionLLM(Optimizer &optimizer,
 
 	auto completion = api->post("chat/completions", request);
 
-	DecomposedPredict result;
 	try {
 		std::string content = completion["choices"][0]["message"]["content"].get<std::string>();
 		auto parsed = Json::parse(PromptUtil::extract_json(content));
@@ -168,7 +315,31 @@ static DecomposedPredict CallDecompositionLLM(Optimizer &optimizer,
 	} catch (const std::exception &e) {
 		throw InternalException("SplitPredictJoin: failed to parse decomposition response: %s", e.what());
 	}
-	return result;
+
+	// Reject responses that do not follow iPDb PREDICT syntax rather than
+	// building a plan around malformed prompts.
+	auto err = ValidateTaskPrompt(result.task1, task1_input, result.task1_output_column, result.task1_output_type);
+	if (err.empty()) {
+		err = ValidateTaskPrompt(result.task2, task2_input, result.task2_output_column, result.task2_output_type);
+		if (!err.empty()) {
+			err = "task2 " + err;
+		}
+	} else {
+		err = "task1 " + err;
+	}
+	if (err.empty()) {
+		DisambiguateOutputColumns(result, task1_input, task2_input);
+	}
+	if (err.empty() && result.task1_output_type != result.task2_output_type) {
+		err = "task1 and task2 must declare the same output type";
+	}
+	if (!err.empty()) {
+		std::cout << "\n[SplitPredictJoin] Skipping rewrite, invalid decomposition: " << err << "\n"
+		          << "  task1: " << result.task1 << "\n"
+		          << "  task2: " << result.task2 << "\n" << std::endl;
+		return false;
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +469,16 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 	// expressions are cleared in step 5.
 	const std::string orig_prompt = orig_info.prompt;
 	const std::string orig_model  = orig_info.model_path;
-	auto decomposed = CallDecompositionLLM(optimizer, orig_info, join);
+	// PREDICT children are created in placeholder order, so the i-th `{{...}}`
+	// in the prompt corresponds to children[i].
+	auto orig_inputs = ExtractPromptInputs(orig_prompt);
+	if (orig_inputs.size() < 2) {
+		return op;
+	}
+	DecomposedPredict decomposed;
+	if (!CallDecompositionLLM(optimizer, orig_info, join, orig_inputs[0], orig_inputs[1], decomposed)) {
+		return op;
+	}
 
 	// ------------------------------------------------------------------
 	// 2. Map each PREDICT child back to its position in join_bindings.
@@ -340,17 +520,15 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		task1_info->secret             = orig_info.secret;
 		task1_info->prompt             = decomposed.task1;
 		task1_info->result_set_names   = {decomposed.task1_output_column};
-		task1_info->result_set_types   = {LogicalType::VARCHAR};
-		task1_info->input_set_names    = orig_info.input_set_names.size() > 0
-		                                    ? vector<string> {orig_info.input_set_names[0]}
-		                                    : vector<string> {"input"};
+		task1_info->result_set_types   = {decomposed.task1_output_type};
+		task1_info->input_set_names    = {orig_inputs[0]};
 		task1_info->options            = orig_info.options;
 
 		vector<unique_ptr<Expression>> task1_args;
 		task1_args.push_back(make_uniq<BoundColumnRefExpression>(
 		    join_types[task1_input_col], join_bindings[task1_input_col]));
 
-		auto task1_predict             = make_uniq<BoundPredictExpression>(LogicalType::VARCHAR,
+		auto task1_predict             = make_uniq<BoundPredictExpression>(decomposed.task1_output_type,
 		                                                                   std::move(task1_args));
 		task1_predict->bound_predict   = std::move(task1_info);
 		proj1_exprs.push_back(std::move(task1_predict));
@@ -379,7 +557,7 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		}
 		// task1 output passthrough.
 		proj2_exprs.push_back(make_uniq<BoundColumnRefExpression>(
-		    LogicalType::VARCHAR, ColumnBinding(proj1_idx, task1_out_pos)));
+		    decomposed.task1_output_type, ColumnBinding(proj1_idx, task1_out_pos)));
 
 		auto task2_info               = make_uniq<BoundPredictInfo>();
 		task2_info->model_type         = orig_info.model_type;
@@ -389,10 +567,8 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		task2_info->secret             = orig_info.secret;
 		task2_info->prompt             = decomposed.task2;
 		task2_info->result_set_names   = {decomposed.task2_output_column};
-		task2_info->result_set_types   = {LogicalType::VARCHAR};
-		task2_info->input_set_names    = orig_info.input_set_names.size() > 1
-		                                    ? vector<string> {orig_info.input_set_names[1]}
-		                                    : vector<string> {"input"};
+		task2_info->result_set_types   = {decomposed.task2_output_type};
+		task2_info->input_set_names    = {orig_inputs[1]};
 		task2_info->options            = orig_info.options;
 
 		// task2 input is the join column remapped through Proj1.
@@ -400,7 +576,7 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		task2_args.push_back(make_uniq<BoundColumnRefExpression>(
 		    join_types[task2_input_col], ColumnBinding(proj1_idx, task2_input_col)));
 
-		auto task2_predict             = make_uniq<BoundPredictExpression>(LogicalType::VARCHAR,
+		auto task2_predict             = make_uniq<BoundPredictExpression>(decomposed.task2_output_type,
 		                                                                   std::move(task2_args));
 		task2_predict->bound_predict   = std::move(task2_info);
 		proj2_exprs.push_back(std::move(task2_predict));
@@ -416,9 +592,9 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 	// ------------------------------------------------------------------
 	{
 		auto lhs = make_uniq<BoundColumnRefExpression>(
-		    LogicalType::VARCHAR, ColumnBinding(proj2_idx, task1_out_pos));
+		    decomposed.task1_output_type, ColumnBinding(proj2_idx, task1_out_pos));
 		auto rhs = make_uniq<BoundColumnRefExpression>(
-		    LogicalType::VARCHAR, ColumnBinding(proj2_idx, task2_out_pos));
+		    decomposed.task2_output_type, ColumnBinding(proj2_idx, task2_out_pos));
 		auto cmp = make_uniq<BoundComparisonExpression>(
 		    ParseComparisonOp(decomposed.predicate), std::move(lhs), std::move(rhs));
 

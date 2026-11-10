@@ -44,6 +44,13 @@ struct BoundPredictInfo {
 	case_insensitive_map_t<Value> options;
 	//! Mapping from original input column name to its precomputed embedding column name
 	case_insensitive_map_t<string> embedding_column_map;
+	//! Whether a scalar BOOLEAN PREDICT relates inputs from two or more distinct relations and can thus be
+	//! evaluated as a join (PredictJoin). Decided at bind time from the inputs' table bindings; false means
+	//! per-row evaluation (PredictChunk), which is always semantically correct.
+	bool is_join = false;
+	//! Per input (in the same order as input_set_names / the expression's children): true if the input belongs
+	//! to the left side of the join. Only meaningful when is_join is set.
+	vector<bool> join_left_inputs;
 
 	bool Equals(const BoundPredictInfo &other) const {
 		return model_type == other.model_type && model_name == other.model_name &&

@@ -396,12 +396,27 @@ void LlmApiPredictor::ScanChunk(ClientContext &client, DataChunk &output, const 
 static std::pair<std::string, std::string> BuildJoinRepr(const DataChunk &input, const idx_t row,
 														  const idx_t n_left_cols,
 														  const PredictInfo &info) {
+	// Precomputed embedding columns are only used for clustering; never put them in the prompt.
+	auto is_embedding_col = [&](const std::string &name) {
+		for (const auto &entry : info.embedding_column_map) {
+			if (StringUtil::CIEquals(entry.second, name)) {
+				return true;
+			}
+		}
+		return false;
+	};
 	std::stringstream left_ss, right_ss;
 	for (idx_t j = 0; j < n_left_cols; ++j) {
+		if (is_embedding_col(info.input_set_names[j])) {
+			continue;
+		}
 		left_ss << info.input_set_names[j] << " = `"
 				<< input.GetValue(info.input_mask[j], row).ToSQLString() << "`, ";
 	}
 	for (idx_t j = n_left_cols; j < info.input_mask.size(); ++j) {
+		if (is_embedding_col(info.input_set_names[j])) {
+			continue;
+		}
 		right_ss << info.input_set_names[j] << " = `"
 				 << input.GetValue(info.input_mask[j], row).ToSQLString() << "`, ";
 	}
@@ -415,6 +430,8 @@ void LlmApiPredictor::PredictJoin(ClientContext &client, DataChunk &input, DataC
 	const steady_clock::time_point begin = steady_clock::now();
 #endif
 	D_ASSERT(n_left_cols <= info.input_mask.size());
+	std::cout << ("No. tuples: " + std::to_string(rows) + " (join, " + std::to_string(n_left_cols) +
+	              " left input(s))\n");
 
 #if LLM_USE_CLUSTER
 	// Step 1: Cluster rows by their full (left+right) input combination so that identical
@@ -584,6 +601,11 @@ void LlmApiPredictor::PredictJoin(ClientContext &client, DataChunk &input, DataC
 	stats->inputs_used += total_in;
 	stats->outputs_used += total_out;
 	stats->tokens_used += total_tokens;
+
+	std::cout << ("Total calls: 1\n");
+	std::cout << ("Total tokens: " + std::to_string(total_tokens) + "\n");
+	std::cout << ("Total input tokens: " + std::to_string(total_in) + "\n");
+	std::cout << ("Total output tokens: " + std::to_string(total_out) + "\n");
 }
 
 // Returns true when the parsed output columns of 'a' and 'b' are identical.

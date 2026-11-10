@@ -56,6 +56,12 @@ struct PredictInfo {
 	vector<LogicalType> result_set_types;
 	case_insensitive_map_t<Value> options;
 	case_insensitive_map_t<string> embedding_column_map;
+
+	//! See BoundPredictInfo::is_join / join_left_inputs
+	bool is_join = false;
+	vector<bool> join_left_inputs;
+	//! Number of leading inputs (after left-first reordering) that form the left side of a join
+	idx_t join_n_left_cols = 0;
 };
 
 class Predictor {

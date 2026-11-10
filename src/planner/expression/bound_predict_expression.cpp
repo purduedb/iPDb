@@ -27,7 +27,15 @@ bool BoundPredictExpression::CanThrow() const {
 }
 
 string BoundPredictExpression::ToString() const {
-	return bound_predict->result_set_names[0] + " (pred.)";
+	if (!bound_predict->is_join) {
+		return bound_predict->result_set_names[0] + " (pred.)";
+	}
+	// Join-mode predicates (evaluated with PredictJoin) are marked so the routing is visible in EXPLAIN.
+	idx_t n_left = 0;
+	for (auto is_left : bound_predict->join_left_inputs) {
+		n_left += is_left ? 1 : 0;
+	}
+	return bound_predict->result_set_names[0] + " (pred. [join, " + std::to_string(n_left) + " left])";
 }
 
 hash_t BoundPredictExpression::Hash() const {
@@ -71,6 +79,10 @@ unique_ptr<Expression> BoundPredictExpression::Copy() const {
 		copy_info->result_set_names = bound_predict->result_set_names;
 		copy_info->input_set_types = bound_predict->input_set_types;
 		copy_info->result_set_types = bound_predict->result_set_types;
+		copy_info->options = bound_predict->options;
+		copy_info->embedding_column_map = bound_predict->embedding_column_map;
+		copy_info->is_join = bound_predict->is_join;
+		copy_info->join_left_inputs = bound_predict->join_left_inputs;
 	}
 
 	auto copy = make_uniq<BoundPredictExpression>(return_type, std::move(new_children));

@@ -32,6 +32,8 @@ struct LlmAggBindData final : FunctionData {
 		copy_info->result_set_names = info->result_set_names;
 		copy_info->input_set_types = info->input_set_types;
 		copy_info->result_set_types = info->result_set_types;
+		copy_info->is_join = info->is_join;
+		copy_info->join_left_inputs = info->join_left_inputs;
 
 		auto copy = make_uniq<LlmAggBindData>(context, copy_info, this->api_key);
 		return std::move(copy);

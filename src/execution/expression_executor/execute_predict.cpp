@@ -38,6 +38,37 @@ unique_ptr<ExpressionState> ExpressionExecutor::InitializeState(const BoundPredi
 		mask_i++;
 	}
 
+	// Join predicates are evaluated with PredictJoin, which takes the first `n_left_cols` inputs as the left
+	// side. Reorder the (executor-private) input mask/names so that left-side inputs come first. Embedding
+	// columns are never on the left, so they stay at the tail. The expression's children keep their
+	// placeholder order (other passes rely on it).
+	auto &info = result->predict_info;
+	if (info.is_join && info.join_left_inputs.size() == info.input_mask.size() &&
+	    info.input_set_names.size() == info.input_mask.size()) {
+		vector<idx_t> order;
+		for (idx_t i = 0; i < info.input_mask.size(); i++) {
+			if (info.join_left_inputs[i]) {
+				order.push_back(i);
+			}
+		}
+		info.join_n_left_cols = order.size();
+		for (idx_t i = 0; i < info.input_mask.size(); i++) {
+			if (!info.join_left_inputs[i]) {
+				order.push_back(i);
+			}
+		}
+		vector<idx_t> new_mask;
+		vector<string> new_names;
+		for (auto i : order) {
+			new_mask.push_back(info.input_mask[i]);
+			new_names.push_back(info.input_set_names[i]);
+		}
+		info.input_mask = std::move(new_mask);
+		info.input_set_names = std::move(new_names);
+	} else {
+		info.is_join = false;
+	}
+
 	auto predictor = PhysicalPredict::InitPredictor(result->predict_info, result->predict_info.secret);
 	predictor->task = PREDICT_LLM_TASK;
 	result->predictor = std::move(predictor);
@@ -62,9 +93,10 @@ void ExpressionExecutor::Execute(const BoundPredictExpression &expr, ExpressionS
 	input.InitializeEmpty(state->types); // schema
 	input.SetCardinality(count);
 
-	bool is_join = (expr.children.size() - pstate.predict_info.embedding_column_map.size()) > 1 &&
-	               pstate.predict_info.result_set_types[0].id() == LogicalTypeId::BOOLEAN;
-	int first_child_cols = 1;
+	// Join-ness is decided at bind time from the inputs' table bindings (see DeterminePredictJoinInputs);
+	// a multi-input BOOLEAN predicate over a single relation is evaluated per row.
+	const bool is_join = pstate.predict_info.is_join &&
+	                     pstate.predict_info.result_set_types[0].id() == LogicalTypeId::BOOLEAN;
 	if (!state->types.empty()) {
 		for (idx_t i = 0; i < expr.children.size(); i++) {
 			D_ASSERT(state->types[i] == expr.children[i]->return_type);
@@ -87,7 +119,8 @@ void ExpressionExecutor::Execute(const BoundPredictExpression &expr, ExpressionS
 	predictions.SetCardinality(count);
 
 	if (is_join) {
-		pstate.predictor->PredictJoin(*context, input, predictions, input.size(), first_child_cols,  pstate.predict_info, pstate.stats);
+		pstate.predictor->PredictJoin(*context, input, predictions, input.size(), pstate.predict_info.join_n_left_cols,
+		                               pstate.predict_info, pstate.stats);
 	} else {
 		pstate.predictor->PredictChunk(*context, input, predictions, input.size(), pstate.predict_info, pstate.stats);
 	}

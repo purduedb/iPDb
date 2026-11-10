@@ -50,7 +50,8 @@ PredictInfo::PredictInfo(BoundPredictInfo bound)
       input_mask(std::move(bound.input_mask)), input_set_names(std::move(bound.input_set_names)),
       result_set_names(std::move(bound.result_set_names)),
       result_set_types(std::move(bound.result_set_types)), options(std::move(bound.options)),
-      embedding_column_map(std::move(bound.embedding_column_map)) {
+      embedding_column_map(std::move(bound.embedding_column_map)), is_join(bound.is_join),
+      join_left_inputs(std::move(bound.join_left_inputs)) {
 }
 
 PhysicalPredict::PhysicalPredict(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperator &child, unique_ptr<BoundPredictInfo> bound_predict_p)

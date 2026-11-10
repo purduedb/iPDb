@@ -4,6 +4,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_predict_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/model_selection.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
@@ -11,6 +12,41 @@ namespace duckdb {
 
 BindResult ExpressionBinder::BindExpression(PredictExpression &expr, idx_t depth) {
 	return BindPredict(expr, depth);
+}
+
+//! Decide whether a scalar PREDICT is a join predicate (evaluated with PredictJoin) or a per-row predicate
+//! (evaluated with PredictChunk). It is a join predicate only if its output is BOOLEAN and its prompt inputs
+//! (excluding appended embedding columns) reference two or more distinct table bindings. Different aliases of the
+//! same table (self-joins) have different table indexes, so they still count as distinct. If any input is not a
+//! plain column reference, its relation cannot be determined and we fall back to per-row evaluation.
+//! Inputs from the first input's relation form the left side of the join.
+static void DeterminePredictJoinInputs(const vector<unique_ptr<Expression>> &children, const idx_t n_prompt_inputs,
+                                       const LogicalType &out_type, BoundPredictInfo &info) {
+	info.is_join = false;
+	info.join_left_inputs.assign(children.size(), false);
+	if (out_type.id() != LogicalTypeId::BOOLEAN || n_prompt_inputs < 2 || n_prompt_inputs > children.size()) {
+		return;
+	}
+	vector<idx_t> table_indexes;
+	for (idx_t i = 0; i < n_prompt_inputs; i++) {
+		auto &child = *children[i];
+		if (child.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return;
+		}
+		table_indexes.push_back(child.Cast<BoundColumnRefExpression>().binding.table_index);
+	}
+	const idx_t left_table = table_indexes[0];
+	bool multiple_tables = false;
+	for (auto table_index : table_indexes) {
+		multiple_tables |= table_index != left_table;
+	}
+	if (!multiple_tables) {
+		return;
+	}
+	info.is_join = true;
+	for (idx_t i = 0; i < n_prompt_inputs; i++) {
+		info.join_left_inputs[i] = table_indexes[i] == left_table;
+	}
 }
 
 BindResult ExpressionBinder::BindPredict(PredictExpression &expr, idx_t depth) {
@@ -32,6 +68,8 @@ BindResult ExpressionBinder::BindPredict(PredictExpression &expr, idx_t depth) {
 			all_emb_sub[emb_data.column] = emb_entry.name;
 		});
 	}
+	// children appended below for embedding columns are not prompt inputs
+	const idx_t n_prompt_inputs = expr.children.size();
 	std::vector<std::string> current_cols(expr.input_col_names);
 	for (auto &col : current_cols) {
 		auto sub_it = all_emb_sub.find(col);
@@ -62,6 +100,7 @@ BindResult ExpressionBinder::BindPredict(PredictExpression &expr, idx_t depth) {
 	}
 
 	auto bound_predict = make_uniq<BoundPredictInfo>();
+	DeterminePredictJoinInputs(children, n_prompt_inputs, expr.out_col_type, *bound_predict);
 	bound_predict->model_name = expr.model_name;
 	bound_predict->prompt = expr.prompt;
 	bound_predict->input_set_names = std::move(expr.input_col_names);
