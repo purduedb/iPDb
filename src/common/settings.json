@@ -293,6 +293,13 @@
         "default_value": "false"
     },
     {
+        "name": "debug_join_decomposition_response",
+        "description": "DEBUG: use this JSON as the LLM's join-decomposition planning response instead of calling the API",
+        "type": "VARCHAR",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
         "name": "debug_physical_table_scan_execution_strategy",
         "description": "DEBUG SETTING: force use of given strategy for executing physical table scans",
         "type": "ENUM<PhysicalTableScanExecutionStrategy>",
@@ -757,9 +764,44 @@
         "custom_implementation": true
     },
     {
+        "name": "join_decomposition_check",
+        "description": "Check a decomposed LLM join at runtime and fall back to pairwise inference if its signals look wrong",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "join_decomposition_max_selectivity",
+        "description": "Runtime check: fall back if the decomposed join's estimated selectivity exceeds this",
+        "type": "DOUBLE",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "join_decomposition_max_unknown",
+        "description": "Runtime check: fall back if either extraction returns unknown/NULL for more than this share of rows",
+        "type": "DOUBLE",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "join_decomposition_min_overlap",
+        "description": "Runtime check (= only): fall back if fewer than this share of probe values appear on the build side",
+        "type": "DOUBLE",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
         "name": "join_decomposition_min_speedup",
         "description": "Decompose an LLM join only if est. pairwise cost >= this factor x est. decomposed cost (higher = safer)",
         "type": "DOUBLE",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
+        "name": "join_decomposition_sample",
+        "description": "Runtime check: number of distinct probe-side inputs to sample before deciding",
+        "type": "UBIGINT",
         "scope": "local",
         "custom_implementation": true
     },

@@ -489,6 +489,17 @@ struct DebugForceNoCrossProductSetting {
 	static constexpr idx_t SettingIndex = 22;
 };
 
+struct DebugJoinDecompositionResponseSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "debug_join_decomposition_response";
+	static constexpr const char *Description =
+	    "DEBUG: use this JSON as the LLM's join-decomposition planning response instead of calling the API";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct DebugPhysicalTableScanExecutionStrategySetting {
 	using RETURN_TYPE = PhysicalTableScanExecutionStrategy;
 	static constexpr const char *Name = "debug_physical_table_scan_execution_strategy";
@@ -1117,12 +1128,67 @@ struct JoinDecompositionSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct JoinDecompositionCheckSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "join_decomposition_check";
+	static constexpr const char *Description =
+	    "Check a decomposed LLM join at runtime and fall back to pairwise inference if its signals look wrong";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct JoinDecompositionMaxSelectivitySetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "join_decomposition_max_selectivity";
+	static constexpr const char *Description =
+	    "Runtime check: fall back if the decomposed join's estimated selectivity exceeds this";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct JoinDecompositionMaxUnknownSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "join_decomposition_max_unknown";
+	static constexpr const char *Description =
+	    "Runtime check: fall back if either extraction returns unknown/NULL for more than this share of rows";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct JoinDecompositionMinOverlapSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "join_decomposition_min_overlap";
+	static constexpr const char *Description =
+	    "Runtime check (= only): fall back if fewer than this share of probe values appear on the build side";
+	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct JoinDecompositionMinSpeedupSetting {
 	using RETURN_TYPE = double;
 	static constexpr const char *Name = "join_decomposition_min_speedup";
 	static constexpr const char *Description =
 	    "Decompose an LLM join only if est. pairwise cost >= this factor x est. decomposed cost (higher = safer)";
 	static constexpr const char *InputType = "DOUBLE";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct JoinDecompositionSampleSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "join_decomposition_sample";
+	static constexpr const char *Description =
+	    "Runtime check: number of distinct probe-side inputs to sample before deciding";
+	static constexpr const char *InputType = "UBIGINT";
 	static void SetLocal(ClientContext &context, const Value &parameter);
 	static void ResetLocal(ClientContext &context);
 	static Value GetSetting(const ClientContext &context);

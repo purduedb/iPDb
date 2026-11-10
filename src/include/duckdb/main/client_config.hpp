@@ -136,6 +136,18 @@ struct ClientConfig {
 	double join_decomposition_min_speedup = 2.0;
 	//! AUTO mode: assumed selectivity of an LLM join predicate (under LIMIT k, pairwise stops after ~k/s pairs)
 	double join_decomposition_selectivity = 0.1;
+	//! Check a decomposed LLM join at runtime (first probe chunk) and fall back to pairwise inference if needed
+	bool join_decomposition_check = true;
+	//! Runtime check: distinct probe-side inputs to sample before deciding
+	idx_t join_decomposition_sample = 64;
+	//! Runtime check: fall back if either extraction yields unknown/NULL for more than this share of rows
+	double join_decomposition_max_unknown = 0.5;
+	//! Runtime check (= only): fall back if fewer than this share of probe values appear on the build side
+	double join_decomposition_min_overlap = 0.2;
+	//! Runtime check: fall back if the decomposed join's estimated selectivity exceeds this
+	double join_decomposition_max_selectivity = 0.5;
+	//! DEBUG: canned join-decomposition planning response (JSON); empty = call the LLM
+	string debug_join_decomposition_response;
 
 	//! Max fixed token size for the output of the LLM tokenizer
 	idx_t llm_max_tokens = 512;

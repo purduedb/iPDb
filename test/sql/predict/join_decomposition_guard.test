@@ -1,0 +1,175 @@
+# name: test/sql/predict/join_decomposition_guard.test
+# description: Plan shapes of LLM join decomposition with the runtime check (T2). The planning call is replaced by
+#              debug_join_decomposition_response, and only EXPLAIN is run, so no LLM API is needed. In AUTO mode the
+#              filter becomes an LLM_JOIN_GUARD (θ, with the original PREDICT as fallback) over a join whose sides each
+#              carry one extraction PREDICT. Without the check, a cross product becomes a comparison join on θ.
+# group: [predict]
+
+# --- settings ---
+
+query IIIIII
+SELECT current_setting('join_decomposition_check'), current_setting('join_decomposition_sample'),
+       current_setting('join_decomposition_max_unknown'), current_setting('join_decomposition_min_overlap'),
+       current_setting('join_decomposition_max_selectivity'), current_setting('debug_join_decomposition_response');
+----
+true	64	0.5	0.2	0.5	(empty)
+
+statement error
+SET join_decomposition_sample = 0;
+----
+must be positive
+
+statement error
+SET join_decomposition_max_unknown = 1.5;
+----
+must be in [0, 1]
+
+statement error
+SET join_decomposition_min_overlap = -0.1;
+----
+must be in [0, 1]
+
+statement error
+SET join_decomposition_max_selectivity = 0;
+----
+must be in (0, 1]
+
+# --- setup ---
+
+statement ok
+CREATE LLM MODEL m PATH 'dummy-model' ON PROMPT API 'http://127.0.0.1:9/v1/';
+
+statement ok
+CREATE TABLE cpu AS SELECT 'cpu ' || i AS name, i AS id, i * 1.5 AS price FROM range(256) t(i);
+
+statement ok
+CREATE TABLE board AS SELECT 'board ' || i AS name, i AS id, i * 2.0 AS price FROM range(256) t(i);
+
+statement ok
+SET debug_join_decomposition_response = '{"task1": "Extract the socket of CPU {{c.name}} {socket_c VARCHAR}", "task1_output_column": "socket_c", "task2": "Extract the socket of motherboard {{b.name}} {socket_b VARCHAR}", "task2_output_column": "socket_b", "predicate": "="}';
+
+# --- auto: guarded decomposition ---
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*LLM_JOIN_GUARD.*CROSS_PRODUCT.*socket_c \(pred\.\) \[decomp: auto, pairwise 65536 >= 2x decomposed 522, checked at runtime\].*socket_b \(pred\.\).*"Fallback": "compatible \(pred\. \[join, 1 left\]\)".*
+
+# other conjuncts stay, in both the decomposed and the fallback predicate (and the join predicate is found even
+# when it is not the first PREDICT conjunct)
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is {{c.name}} {fast BOOLEAN}' AND LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*LLM_JOIN_GUARD.*"Expression": "\(fast \(pred\.\) AND \(#\d+ = #\d+\)\)".*"Fallback": "\(fast \(pred\.\) AND compatible \(pred\. \[join, 1 left\]\)\)".*
+
+# a join with another condition (any-join); its estimate (256 pairs) needs a lower margin to decompose
+
+statement ok
+SET join_decomposition_min_speedup = 0.1;
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE c.id + b.id < 300 AND LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*LLM_JOIN_GUARD.*BLOCKWISE_NL_JOIN.*socket_c \(pred\.\) \[decomp: auto, pairwise 256 >= 0\.1x decomposed 522, checked at runtime\].*socket_b \(pred\.\).*
+
+statement ok
+RESET join_decomposition_min_speedup;
+
+# a projection (subquery) between the filter and the join
+
+statement ok
+SET debug_join_decomposition_response = '{"task1": "Extract the socket of CPU {{cn}} {socket_c VARCHAR}", "task1_output_column": "socket_c", "task2": "Extract the socket of motherboard {{bn}} {socket_b VARCHAR}", "task2_output_column": "socket_b", "predicate": "="}';
+
+query II
+EXPLAIN (FORMAT json) SELECT ci, bi FROM (SELECT c.name AS cn, b.name AS bn, c.id AS ci, b.id AS bi FROM cpu c, board b)
+WHERE LLM m PROMPT 'is CPU {{cn}} {compatible BOOLEAN} with motherboard {{bn}}';
+----
+physical_plan	<REGEX>:.*LLM_JOIN_GUARD.*CROSS_PRODUCT.*socket_c \(pred\.\).*socket_b \(pred\.\).*
+
+statement ok
+SET debug_join_decomposition_response = '{"task1": "Extract the socket of CPU {{c.name}} {socket_c VARCHAR}", "task1_output_column": "socket_c", "task2": "Extract the socket of motherboard {{b.name}} {socket_b VARCHAR}", "task2_output_column": "socket_b", "predicate": "="}';
+
+# --- without the runtime check: a cross product becomes a hash join on the extracted columns ---
+
+statement ok
+SET join_decomposition_check = false;
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*socket_c \(pred\.\) \[decomp: auto, pairwise 65536 >= 2x decomposed 522\].*socket_b \(pred\.\).*
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<!REGEX>:.*LLM_JOIN_GUARD.*
+
+statement ok
+RESET join_decomposition_check;
+
+# always: no runtime check either
+
+statement ok
+SET join_decomposition = 'always';
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*socket_c \(pred\.\) \[decomp: always\].*
+
+# an inequality θ cannot be a hash join
+
+statement ok
+SET debug_join_decomposition_response = '{"task1": "Extract the price in USD of CPU {{c.name}} {price_c DOUBLE}", "task1_output_column": "price_c", "task2": "Extract the price in USD of motherboard {{b.name}} {price_b DOUBLE}", "task2_output_column": "price_b", "predicate": ">"}';
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {pricier BOOLEAN} than motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*(PIECEWISE_MERGE_JOIN|IE_JOIN|NESTED_LOOP_JOIN).*price_c \(pred\.\).*
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {pricier BOOLEAN} than motherboard {{b.name}}';
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*
+
+statement ok
+RESET join_decomposition;
+
+# --- invalid planning responses keep the pairwise join ---
+
+statement ok
+SET debug_join_decomposition_response = 'not json';
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*compatible \(pred\. \[join, 1 left\]\) \[decomp: auto, pairwise 65536 >= 2x decomposed 522, no usable rewrite\].*
+
+# the two extractions must declare the same output type
+
+statement ok
+SET debug_join_decomposition_response = '{"task1": "Extract the socket of CPU {{c.name}} {socket_c VARCHAR}", "task1_output_column": "socket_c", "task2": "Extract the socket of motherboard {{b.name}} {socket_b INTEGER}", "task2_output_column": "socket_b", "predicate": "="}';
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<REGEX>:.*no usable rewrite.*
+
+# --- predicates with more than two inputs are not decomposed ---
+
+query II
+EXPLAIN (FORMAT json) SELECT c.id, b.id FROM cpu c, board b
+WHERE LLM m PROMPT 'is CPU {{c.name}} at {{c.price}} {compatible BOOLEAN} with motherboard {{b.name}}';
+----
+physical_plan	<!REGEX>:.*decomp:.*

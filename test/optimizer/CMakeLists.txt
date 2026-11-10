@@ -1,4 +1,4 @@
-add_library_unity(test_optimizer OBJECT filter_pushdown_alias.cpp
+add_library_unity(test_optimizer OBJECT decomposition_guard.cpp filter_pushdown_alias.cpp
                   union_alls.cpp)
 
 set(ALL_OBJECT_FILES

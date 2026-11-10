@@ -208,6 +208,16 @@ void LogicalOperatorVisitor::EnumerateExpressions(LogicalOperator &op,
 		}
 		break;
 	}
+	case LogicalOperatorType::LOGICAL_FILTER: {
+		auto &filter = op.Cast<LogicalFilter>();
+		if (filter.guard_condition) {
+			callback(&filter.guard_condition);
+		}
+		if (filter.guard_fallback) {
+			callback(&filter.guard_fallback);
+		}
+		break;
+	}
 	default:
 		break;
 	}

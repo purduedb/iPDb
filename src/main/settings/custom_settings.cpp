@@ -1596,6 +1596,96 @@ Value JoinDecompositionSelectivitySetting::GetSetting(const ClientContext &conte
 	return Value::DOUBLE(ClientConfig::GetConfig(context).join_decomposition_selectivity);
 }
 
+void JoinDecompositionCheckSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).join_decomposition_check = input.GetValue<bool>();
+}
+
+void JoinDecompositionCheckSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_check = ClientConfig().join_decomposition_check;
+}
+
+Value JoinDecompositionCheckSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).join_decomposition_check);
+}
+
+void JoinDecompositionSampleSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<uint64_t>();
+	if (value == 0) {
+		throw InvalidInputException("join_decomposition_sample must be positive");
+	}
+	ClientConfig::GetConfig(context).join_decomposition_sample = value;
+}
+
+void JoinDecompositionSampleSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_sample = ClientConfig().join_decomposition_sample;
+}
+
+Value JoinDecompositionSampleSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(ClientConfig::GetConfig(context).join_decomposition_sample);
+}
+
+void JoinDecompositionMaxUnknownSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (value < 0 || value > 1) {
+		throw InvalidInputException("join_decomposition_max_unknown must be in [0, 1]");
+	}
+	ClientConfig::GetConfig(context).join_decomposition_max_unknown = value;
+}
+
+void JoinDecompositionMaxUnknownSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_max_unknown = ClientConfig().join_decomposition_max_unknown;
+}
+
+Value JoinDecompositionMaxUnknownSetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).join_decomposition_max_unknown);
+}
+
+void JoinDecompositionMinOverlapSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (value < 0 || value > 1) {
+		throw InvalidInputException("join_decomposition_min_overlap must be in [0, 1]");
+	}
+	ClientConfig::GetConfig(context).join_decomposition_min_overlap = value;
+}
+
+void JoinDecompositionMinOverlapSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_min_overlap = ClientConfig().join_decomposition_min_overlap;
+}
+
+Value JoinDecompositionMinOverlapSetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).join_decomposition_min_overlap);
+}
+
+void JoinDecompositionMaxSelectivitySetting::SetLocal(ClientContext &context, const Value &input) {
+	auto value = input.GetValue<double>();
+	if (value <= 0 || value > 1) {
+		throw InvalidInputException("join_decomposition_max_selectivity must be in (0, 1]");
+	}
+	ClientConfig::GetConfig(context).join_decomposition_max_selectivity = value;
+}
+
+void JoinDecompositionMaxSelectivitySetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_max_selectivity =
+	    ClientConfig().join_decomposition_max_selectivity;
+}
+
+Value JoinDecompositionMaxSelectivitySetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).join_decomposition_max_selectivity);
+}
+
+void DebugJoinDecompositionResponseSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).debug_join_decomposition_response = input.ToString();
+}
+
+void DebugJoinDecompositionResponseSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).debug_join_decomposition_response =
+	    ClientConfig().debug_join_decomposition_response;
+}
+
+Value DebugJoinDecompositionResponseSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).debug_join_decomposition_response);
+}
+
 //===--------------------------------------------------------------------===//
 // Pull Predict Filter
 //===--------------------------------------------------------------------===//

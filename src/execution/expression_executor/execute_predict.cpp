@@ -1,6 +1,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_predict_expression.hpp"
 #include "duckdb/execution/operator/projection/physical_predict.hpp"
+#include "duckdb/execution/operator/filter/decomposition_guard.hpp"
 
 #if defined(ENABLE_PREDICT) && PREDICTOR_IMPL == 3
 #include "duckdb_llama_cpp.hpp"
@@ -25,12 +26,17 @@ public:
 	unique_ptr<Predictor> predictor;
 	unique_ptr<PredictStats> stats;
 	bool is_loaded = false;
+	//! Runtime check of a decomposed join (T2), if this PREDICT is one of its extractions
+	shared_ptr<DecompositionGuardState> guard;
+	DecompositionGuardRole guard_role = DecompositionGuardRole::NONE;
 };
 
 unique_ptr<ExpressionState> ExpressionExecutor::InitializeState(const BoundPredictExpression &expr,
                                                                 ExpressionExecutorState &state) {
 	auto result = make_uniq<ExecutePredictState>(expr, state);
 	result->predict_info = PredictInfo(*expr.bound_predict);
+	result->guard = expr.bound_predict->decomposition_guard;
+	result->guard_role = expr.bound_predict->guard_role;
 	idx_t mask_i = 0;
 	for (auto &child : expr.children) {
 		result->AddChild(*child);
@@ -107,6 +113,15 @@ void ExpressionExecutor::Execute(const BoundPredictExpression &expr, ExpressionS
 	arguments.SetCardinality(count);
 	arguments.Verify();
 
+	// After the runtime check of a decomposed join chose the pairwise fallback, the probe-side extraction is not
+	// needed any more: skip the LLM calls.
+	if (pstate.guard && pstate.guard_role == DecompositionGuardRole::PROBE_EXTRACTION &&
+	    pstate.guard->IsFallback()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		ConstantVector::SetNull(result, true);
+		return;
+	}
+
 	if (!pstate.is_loaded) {
 		pstate.predictor->Config(*context, pstate.predict_info.options);
 		pstate.predictor->Load(*context, pstate.predict_info.model_path, pstate.stats);
@@ -130,6 +145,10 @@ void ExpressionExecutor::Execute(const BoundPredictExpression &expr, ExpressionS
 
 	result.Reference(predictions.data[0]);
 	// predictions.data[0].Reference(nullptr);
+
+	if (pstate.guard && !expr.children.empty()) {
+		pstate.guard->RecordExtraction(pstate.guard_role, arguments.data[0], result, count);
+	}
 
 	if (callback) {
 		callback(pstate.stats->llm_calls, pstate.stats->inputs_used, pstate.stats->outputs_used, pstate.stats->tokens_used);

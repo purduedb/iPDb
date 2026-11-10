@@ -1,4 +1,5 @@
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
+#include "duckdb/execution/operator/filter/physical_decomposition_guard.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
@@ -13,7 +14,15 @@ namespace duckdb {
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalFilter &op) {
 	D_ASSERT(op.children.size() == 1);
 	reference<PhysicalOperator> plan = CreatePlan(*op.children[0]);
-	if (!op.expressions.empty()) {
+	if (op.decomposition_guard) {
+		// runtime-checked join decomposition: choose between θ and the original LLM join predicate at runtime
+		D_ASSERT(op.guard_condition && op.guard_fallback);
+		auto &guard = Make<PhysicalDecompositionGuard>(plan.get().GetTypes(), std::move(op.expressions),
+		                                               std::move(op.guard_condition), std::move(op.guard_fallback),
+		                                               op.decomposition_guard, op.estimated_cardinality);
+		guard.children.push_back(plan);
+		plan = guard;
+	} else if (!op.expressions.empty()) {
 		// create a filter if there is anything to filter
 		auto &filter = Make<PhysicalFilter>(plan.get().GetTypes(), std::move(op.expressions), op.estimated_cardinality, op.limit);
 		filter.children.push_back(plan);

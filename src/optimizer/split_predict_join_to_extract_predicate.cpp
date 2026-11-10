@@ -12,6 +12,8 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/execution/operator/filter/decomposition_guard.hpp"
 
 #if defined(ENABLE_PREDICT) && defined(ENABLE_LLM_API)
 #include "openai.hpp"
@@ -29,7 +31,24 @@ namespace duckdb {
 static bool IsSupportedJoin(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
 		type == LogicalOperatorType::LOGICAL_JOIN ||
-		type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+		type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		type == LogicalOperatorType::LOGICAL_ANY_JOIN;
+}
+
+// ---------------------------------------------------------------------------
+// Local helper: from a filter's child, skip a chain of projections (e.g. a
+// subquery's select list, or debug-build verification projections) and return
+// the join below them, or nullptr. `chain` receives the projections, top first.
+// ---------------------------------------------------------------------------
+static LogicalOperator *FindJoinBelow(LogicalOperator &filter_child, vector<LogicalProjection *> *chain = nullptr) {
+	LogicalOperator *current = &filter_child;
+	while (current->type == LogicalOperatorType::LOGICAL_PROJECTION && current->children.size() == 1) {
+		if (chain) {
+			chain->push_back(&current->Cast<LogicalProjection>());
+		}
+		current = current->children[0].get();
+	}
+	return IsSupportedJoin(current->type) ? current : nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,14 +323,21 @@ static bool CallDecompositionLLM(Optimizer &optimizer, const BoundPredictInfo &p
 	request["response_format"] = response_schema;
 
 	// A failed or unparsable planning call keeps the original (pairwise) join instead of failing the query.
+	// DEBUG: a canned planning response (debug_join_decomposition_response) replaces the API call.
+	const auto &debug_response = ClientConfig::GetConfig(optimizer.context).debug_join_decomposition_response;
 	try {
-		auto completion = api->post("chat/completions", request);
-		if (completion.contains("error")) {
-			std::cout << "\n[SplitPredictJoin] Skipping rewrite, planning call failed: " << completion["error"].dump()
-			          << "\n" << std::endl;
-			return false;
+		std::string content;
+		if (!debug_response.empty()) {
+			content = debug_response;
+		} else {
+			auto completion = api->post("chat/completions", request);
+			if (completion.contains("error")) {
+				std::cout << "\n[SplitPredictJoin] Skipping rewrite, planning call failed: "
+				          << completion["error"].dump() << "\n" << std::endl;
+				return false;
+			}
+			content = completion["choices"][0]["message"]["content"].get<std::string>();
 		}
-		std::string content = completion["choices"][0]["message"]["content"].get<std::string>();
 		auto parsed = Json::parse(PromptUtil::extract_json(content));
 		result.task1               = parsed["task1"].get<std::string>();
 		result.task1_output_column = parsed["task1_output_column"].get<std::string>();
@@ -407,10 +433,10 @@ static double OperatorCardinality(ClientContext &context, LogicalOperator &op) {
 static DecompositionEstimate EstimateDecomposition(ClientContext &context, LogicalOperator &filter_child,
                                                    int64_t limit, double selectivity, double min_speedup) {
 	DecompositionEstimate est;
-	// The filter's child is either the join or a projection directly on top of it (see CanOptimize).
-	LogicalOperator *join = &filter_child;
-	if (join->type == LogicalOperatorType::LOGICAL_PROJECTION && !join->children.empty()) {
-		join = join->children[0].get();
+	// The filter's child is the join, or a chain of projections on top of it (see CanOptimize).
+	LogicalOperator *join = FindJoinBelow(filter_child);
+	if (!join) {
+		join = &filter_child;
 	}
 	if (join->children.size() == 2) {
 		est.left = OperatorCardinality(context, *join->children[0]);
@@ -467,12 +493,8 @@ bool SplitPredictJoinToExtractPredicate::CanOptimize(LogicalOperator &op) {
 	}
 
 	auto &direct_child = *op.children[0];
-	if (IsSupportedJoin(direct_child.type)) {
-		// FILTER → JOIN
-	} else if (direct_child.type == LogicalOperatorType::LOGICAL_PROJECTION &&
-	           !direct_child.children.empty() && IsSupportedJoin(direct_child.children[0]->type)) {
-		// FILTER → PROJECT → JOIN
-	} else {
+	// FILTER → JOIN, or FILTER → PROJECTION → ... → PROJECTION → JOIN
+	if (!FindJoinBelow(direct_child)) {
 		return false;
 	}
 
@@ -511,52 +533,109 @@ bool SplitPredictJoinToExtractPredicate::CanOptimize(LogicalOperator &op) {
 }
 
 // ---------------------------------------------------------------------------
+// Local helper: build the BoundPredictInfo of one extraction task.
+// ---------------------------------------------------------------------------
+static unique_ptr<BoundPredictInfo> MakeTaskInfo(const BoundPredictInfo &orig, const string &prompt,
+                                                 const string &output_column, const LogicalType &output_type,
+                                                 const string &input_name) {
+	auto info = make_uniq<BoundPredictInfo>();
+	info->model_type = orig.model_type;
+	info->model_name = orig.model_name;
+	info->model_path = orig.model_path;
+	info->base_api = orig.base_api;
+	info->secret = orig.secret;
+	info->prompt = prompt;
+	info->result_set_names = {output_column};
+	info->result_set_types = {output_type};
+	info->input_set_names = {input_name};
+	info->options = orig.options;
+	return info;
+}
+
+// ---------------------------------------------------------------------------
 unique_ptr<LogicalOperator>
 SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperator> op) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_FILTER);
 
-	auto &filter      = op->Cast<LogicalFilter>();
-	auto &join        = *op->children[0];
-
-	// Ensure join types are resolved so we can build column-ref expressions.
-	if (join.types.empty()) {
-		join.ResolveOperatorTypes();
-	}
-
-	auto join_bindings = join.GetColumnBindings();
-	auto &join_types   = join.types;
-	D_ASSERT(join_bindings.size() == join_types.size());
-
 #if defined(ENABLE_PREDICT) && defined(ENABLE_LLM_API)
-	// ------------------------------------------------------------------
-	// 1. Find the qualifying PREDICT and decompose it via the LLM.
-	// ------------------------------------------------------------------
-	BoundPredictExpression *orig_predict = nullptr;
-	for (auto &expr : filter.expressions) {
-		orig_predict = FindFirstPredict(*expr);
-		if (orig_predict) {
-			break;
-		}
-	}
-	D_ASSERT(orig_predict && orig_predict->bound_predict);
-	D_ASSERT(orig_predict->children.size() >= 2);
-
-	auto &orig_info = *orig_predict->bound_predict;
-	// Capture strings now — orig_info becomes dangling once the filter
-	// expressions are cleared in step 5.
-	const std::string orig_prompt = orig_info.prompt;
-	const std::string orig_model  = orig_info.model_path;
-	// PREDICT children are created in placeholder order, so the i-th `{{...}}`
-	// in the prompt corresponds to children[i].
-	auto orig_inputs = ExtractPromptInputs(orig_prompt);
-	if (orig_inputs.size() < 2) {
+	auto &filter = op->Cast<LogicalFilter>();
+	// The filter's child is the join, or a chain of projections on top of it (see CanOptimize).
+	auto &direct_child = *op->children[0];
+	vector<LogicalProjection *> chain; // top first
+	auto *join_ptr = FindJoinBelow(direct_child, &chain);
+	if (!join_ptr || join_ptr->children.size() != 2) {
 		return op;
 	}
+	auto &join = *join_ptr;
 
 	// ------------------------------------------------------------------
-	// 1a. Decide whether to decompose (T1 + T3), before spending the
-	//     planning call. The session setting can be overridden per model
-	//     with OPTIONS {"join_decomposition": 'auto' | 'always' | 'never'}.
+	// 1-2. Find the qualifying PREDICT: a top-level filter conjunct (only
+	//      a conjunct can be replaced by a comparison; the others are kept)
+	//      with exactly two inputs, which come from the two join sides.
+	// ------------------------------------------------------------------
+	ColumnBinding input_binding[2];
+	idx_t input_side[2];
+	vector<std::string> orig_inputs;
+	// Maps one PREDICT input to the join side (child) that produces it; false if it can't.
+	auto map_input = [&](Expression &child, ColumnBinding &binding_out, idx_t &side_out) {
+		if (child.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto binding = child.Cast<BoundColumnRefExpression>().binding;
+		// Follow the binding through the projections between the filter and the join.
+		for (auto *proj : chain) {
+			if (binding.table_index != proj->table_index || binding.column_index >= proj->expressions.size()) {
+				return false;
+			}
+			auto &projected = *proj->expressions[binding.column_index];
+			if (projected.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return false;
+			}
+			binding = projected.Cast<BoundColumnRefExpression>().binding;
+		}
+		for (idx_t side = 0; side < 2; side++) {
+			for (auto &cb : join.children[side]->GetColumnBindings()) {
+				if (cb == binding) {
+					binding_out = binding;
+					side_out = side;
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	idx_t predict_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < filter.expressions.size() && predict_idx == DConstants::INVALID_INDEX; i++) {
+		auto &expr = *filter.expressions[i];
+		if (expr.GetExpressionClass() != ExpressionClass::PREDICT) {
+			continue;
+		}
+		auto &candidate = expr.Cast<BoundPredictExpression>();
+		if (!candidate.bound_predict || candidate.children.size() < 2) {
+			continue;
+		}
+		// PREDICT children are created in placeholder order, so the i-th `{{...}}`
+		// in the prompt corresponds to children[i].
+		auto inputs = ExtractPromptInputs(candidate.bound_predict->prompt);
+		if (inputs.size() != 2) {
+			continue;
+		}
+		if (!map_input(*candidate.children[0], input_binding[0], input_side[0]) ||
+		    !map_input(*candidate.children[1], input_binding[1], input_side[1]) || input_side[0] == input_side[1]) {
+			continue;
+		}
+		predict_idx = i;
+		orig_inputs = std::move(inputs);
+	}
+	if (predict_idx == DConstants::INVALID_INDEX) {
+		return op;
+	}
+	auto &orig_info = *filter.expressions[predict_idx]->Cast<BoundPredictExpression>().bound_predict;
+
+	// ------------------------------------------------------------------
+	// 3. Decide whether to decompose (T1 + T3), before spending the
+	//    planning call. The session setting can be overridden per model
+	//    with OPTIONS {"join_decomposition": 'auto' | 'always' | 'never'}.
 	// ------------------------------------------------------------------
 	const auto &config = ClientConfig::GetConfig(optimizer.context);
 	auto mode = config.join_decomposition;
@@ -573,8 +652,8 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		decision_note = "always";
 		break;
 	case JoinDecompositionMode::AUTO: {
-		auto est = EstimateDecomposition(optimizer.context, join, filter.limit, config.join_decomposition_selectivity,
-		                                 config.join_decomposition_min_speedup);
+		auto est = EstimateDecomposition(optimizer.context, direct_child, filter.limit,
+		                                 config.join_decomposition_selectivity, config.join_decomposition_min_speedup);
 		decision_note = DecompositionNote(est, config.join_decomposition_min_speedup);
 		if (!est.decompose) {
 			orig_info.decomposition_note = decision_note;
@@ -583,189 +662,190 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		break;
 	}
 	}
+	// T2: in AUTO mode the decomposition is checked at runtime and can fall back to the pairwise predicate.
+	const bool guarded = mode == JoinDecompositionMode::AUTO && config.join_decomposition_check;
 
 	DecomposedPredict decomposed;
-	if (!CallDecompositionLLM(optimizer, orig_info, join, orig_inputs[0], orig_inputs[1], decomposed)) {
+	if (!CallDecompositionLLM(optimizer, orig_info, direct_child, orig_inputs[0], orig_inputs[1], decomposed)) {
 		// The planning call failed or returned an invalid decomposition; keep the pairwise join.
 		orig_info.decomposition_note = decision_note + ", no usable rewrite";
 		return op;
 	}
+	if (guarded) {
+		decision_note += ", checked at runtime";
+	}
+	const auto comparison = ParseComparisonOp(decomposed.predicate);
+	const auto output_type = decomposed.task1_output_type;
+	const std::string orig_prompt = orig_info.prompt;
+	const std::string orig_model = orig_info.model_path;
+
+	shared_ptr<DecompositionGuardState> guard;
+	if (guarded) {
+		DecompositionGuardConfig guard_config;
+		guard_config.sample_size = config.join_decomposition_sample;
+		guard_config.max_unknown_rate = config.join_decomposition_max_unknown;
+		guard_config.min_overlap = config.join_decomposition_min_overlap;
+		guard_config.max_selectivity = config.join_decomposition_max_selectivity;
+		// The join materializes children[1] (build side) before children[0] (probe side) streams through it.
+		const bool build_is_task1 = input_side[0] == 1;
+		guard = make_shared_ptr<DecompositionGuardState>(guard_config, comparison, build_is_task1,
+		                                                 output_type.id() == LogicalTypeId::VARCHAR);
+	}
 
 	// ------------------------------------------------------------------
-	// 2. Map each PREDICT child back to its position in join_bindings.
-	//    children[0] → task1 input, children[1] → task2 input.
+	// 4. Put one extraction on each side of the join:
+	//      JOIN ─┬─ PROJ_0 [side-0 cols + PREDICT(task on side 0)]
+	//            └─ PROJ_1 [side-1 cols + PREDICT(task on side 1)]
+	//    Each extraction then runs once per row of its side (with that
+	//    side's own dedup cache), and the build side (children[1]) is fully
+	//    extracted before any pair is formed, which the runtime check uses.
 	// ------------------------------------------------------------------
-	auto find_join_col = [&](const ColumnBinding &cb) -> idx_t {
-		for (idx_t i = 0; i < join_bindings.size(); i++) {
-			if (join_bindings[i] == cb) {
-				return i;
+	// Number of output columns of the join's left side before the rewrite (for remapping projection maps).
+	const idx_t old_left_output_count = join.children[0]->GetColumnBindings().size();
+	ColumnBinding task_output[2]; // indexed by task (0 = task1, 1 = task2)
+	for (idx_t task = 0; task < 2; task++) {
+		const idx_t side = input_side[task];
+		auto &child = join.children[side];
+		child->ResolveOperatorTypes();
+		auto child_bindings = child->GetColumnBindings();
+		auto &child_types = child->types;
+		D_ASSERT(child_bindings.size() == child_types.size());
+
+		idx_t input_col = DConstants::INVALID_INDEX;
+		vector<unique_ptr<Expression>> exprs;
+		for (idx_t i = 0; i < child_bindings.size(); i++) {
+			exprs.push_back(make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]));
+			if (child_bindings[i] == input_binding[task]) {
+				input_col = i;
 			}
 		}
-		return DConstants::INVALID_INDEX;
-	};
+		D_ASSERT(input_col != DConstants::INVALID_INDEX);
 
-	const idx_t task1_input_col =
-	    find_join_col(orig_predict->children[0]->Cast<BoundColumnRefExpression>().binding);
-	const idx_t task2_input_col =
-	    find_join_col(orig_predict->children[1]->Cast<BoundColumnRefExpression>().binding);
-	D_ASSERT(task1_input_col != DConstants::INVALID_INDEX);
-	D_ASSERT(task2_input_col != DConstants::INVALID_INDEX);
-
-	// ------------------------------------------------------------------
-	// 3. Proj1: pass through all join columns + PREDICT(task1) appended.
-	//    Output: {proj1_idx, 0..N-1} = join cols, {proj1_idx, N} = task1
-	// ------------------------------------------------------------------
-	idx_t proj1_idx = optimizer.binder.GenerateTableIndex();
-	{
-		vector<unique_ptr<Expression>> proj1_exprs;
-		proj1_exprs.reserve(join_bindings.size() + 1);
-		for (idx_t i = 0; i < join_bindings.size(); i++) {
-			proj1_exprs.push_back(make_uniq<BoundColumnRefExpression>(join_types[i], join_bindings[i]));
+		auto info = task == 0 ? MakeTaskInfo(orig_info, decomposed.task1, decomposed.task1_output_column,
+		                                     decomposed.task1_output_type, orig_inputs[0])
+		                      : MakeTaskInfo(orig_info, decomposed.task2, decomposed.task2_output_column,
+		                                     decomposed.task2_output_type, orig_inputs[1]);
+		if (task == 0) {
+			info->decomposition_note = decision_note;
 		}
+		if (guard) {
+			info->decomposition_guard = guard;
+			info->guard_role =
+			    side == 1 ? DecompositionGuardRole::BUILD_EXTRACTION : DecompositionGuardRole::PROBE_EXTRACTION;
+		}
+		vector<unique_ptr<Expression>> args;
+		args.push_back(make_uniq<BoundColumnRefExpression>(child_types[input_col], child_bindings[input_col]));
+		auto task_predict = make_uniq<BoundPredictExpression>(info->result_set_types[0], std::move(args));
+		task_predict->bound_predict = std::move(info);
+		exprs.push_back(std::move(task_predict));
 
-		auto task1_info               = make_uniq<BoundPredictInfo>();
-		task1_info->model_type         = orig_info.model_type;
-		task1_info->model_name         = orig_info.model_name;
-		task1_info->model_path         = orig_info.model_path;
-		task1_info->base_api           = orig_info.base_api;
-		task1_info->secret             = orig_info.secret;
-		task1_info->prompt             = decomposed.task1;
-		task1_info->result_set_names   = {decomposed.task1_output_column};
-		task1_info->result_set_types   = {decomposed.task1_output_type};
-		task1_info->input_set_names    = {orig_inputs[0]};
-		task1_info->options            = orig_info.options;
-		task1_info->decomposition_note = decision_note;
+		const idx_t proj_idx = optimizer.binder.GenerateTableIndex();
+		auto proj = make_uniq<LogicalProjection>(proj_idx, std::move(exprs));
+		task_output[task] = ColumnBinding(proj_idx, child_bindings.size());
 
-		vector<unique_ptr<Expression>> task1_args;
-		task1_args.push_back(make_uniq<BoundColumnRefExpression>(
-		    join_types[task1_input_col], join_bindings[task1_input_col]));
+		// Operators above the projection now see the side's columns through it.
+		BindingFix fix;
+		fix.stop_operator = proj.get();
+		for (idx_t i = 0; i < child_bindings.size(); i++) {
+			fix.old_bindings.push_back(child_bindings[i]);
+			fix.new_bindings.push_back(ColumnBinding(proj_idx, i));
+		}
+		pending_fixes.push_back(std::move(fix));
 
-		auto task1_predict             = make_uniq<BoundPredictExpression>(decomposed.task1_output_type,
-		                                                                   std::move(task1_args));
-		task1_predict->bound_predict   = std::move(task1_info);
-		proj1_exprs.push_back(std::move(task1_predict));
+		if (child->has_estimated_cardinality) {
+			proj->SetEstimatedCardinality(child->estimated_cardinality);
+		}
+		proj->children.push_back(std::move(child));
+		proj->ResolveOperatorTypes();
+		child = std::move(proj);
 
-		auto proj1 = make_uniq<LogicalProjection>(proj1_idx, std::move(proj1_exprs));
-		proj1->children.push_back(std::move(op->children[0]));
-		op->children[0] = std::move(proj1);
+		// A join with a projection map on this side must also output the extracted column.
+		if (join.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    join.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+			auto &logical_join = join.Cast<LogicalJoin>();
+			auto &side_map = side == 0 ? logical_join.left_projection_map : logical_join.right_projection_map;
+			if (!side_map.empty()) {
+				side_map.push_back(child_bindings.size());
+			}
+		}
+	}
+	// The left side gained a column: shift indexes of right-side columns in a direct filter's projection map.
+	if (chain.empty() && !filter.projection_map.empty()) {
+		for (auto &idx : filter.projection_map) {
+			if (idx >= old_left_output_count) {
+				idx++;
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------
-	// 4. Proj2: pass through all Proj1 columns + PREDICT(task2) appended.
-	//    task2's input column is remapped to Proj1 output space.
-	//    Output: {proj2_idx, 0..N-1} = join cols,
-	//            {proj2_idx, N}   = task1 output (passthrough),
-	//            {proj2_idx, N+1} = task2 output
+	// 5. Replace the PREDICT conjunct with θ = task1 <op> task2.
 	// ------------------------------------------------------------------
-	idx_t proj2_idx = optimizer.binder.GenerateTableIndex();
-	const idx_t task1_out_pos = join_bindings.size();      // col N in proj1/proj2
-	const idx_t task2_out_pos = join_bindings.size() + 1;  // col N+1 in proj2
-	{
-		vector<unique_ptr<Expression>> proj2_exprs;
-		proj2_exprs.reserve(join_bindings.size() + 2);
-		for (idx_t i = 0; i < join_bindings.size(); i++) {
-			proj2_exprs.push_back(make_uniq<BoundColumnRefExpression>(
-			    join_types[i], ColumnBinding(proj1_idx, i)));
+	auto orig_expr = std::move(filter.expressions[predict_idx]);
+	filter.expressions.erase_at(predict_idx);
+	filter.limit = -1;
+	string plan_shape;
+
+	if (!guarded && join.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		// Unchecked decomposition over a cross product: θ becomes the join condition (hash join for =).
+		JoinCondition cond;
+		const bool task1_left = input_side[0] == 0;
+		cond.left = make_uniq<BoundColumnRefExpression>(output_type, task1_left ? task_output[0] : task_output[1]);
+		cond.right = make_uniq<BoundColumnRefExpression>(output_type, task1_left ? task_output[1] : task_output[0]);
+		cond.comparison = task1_left ? comparison : FlipComparisonExpression(comparison);
+		auto comparison_join = make_uniq<LogicalComparisonJoin>(JoinType::INNER);
+		comparison_join->conditions.push_back(std::move(cond));
+		comparison_join->children = std::move(join.children);
+		if (join.has_estimated_cardinality) {
+			comparison_join->SetEstimatedCardinality(join.estimated_cardinality);
 		}
-		// task1 output passthrough.
-		proj2_exprs.push_back(make_uniq<BoundColumnRefExpression>(
-		    decomposed.task1_output_type, ColumnBinding(proj1_idx, task1_out_pos)));
-
-		auto task2_info               = make_uniq<BoundPredictInfo>();
-		task2_info->model_type         = orig_info.model_type;
-		task2_info->model_name         = orig_info.model_name;
-		task2_info->model_path         = orig_info.model_path;
-		task2_info->base_api           = orig_info.base_api;
-		task2_info->secret             = orig_info.secret;
-		task2_info->prompt             = decomposed.task2;
-		task2_info->result_set_names   = {decomposed.task2_output_column};
-		task2_info->result_set_types   = {decomposed.task2_output_type};
-		task2_info->input_set_names    = {orig_inputs[1]};
-		task2_info->options            = orig_info.options;
-
-		// task2 input is the join column remapped through Proj1.
-		vector<unique_ptr<Expression>> task2_args;
-		task2_args.push_back(make_uniq<BoundColumnRefExpression>(
-		    join_types[task2_input_col], ColumnBinding(proj1_idx, task2_input_col)));
-
-		auto task2_predict             = make_uniq<BoundPredictExpression>(decomposed.task2_output_type,
-		                                                                   std::move(task2_args));
-		task2_predict->bound_predict   = std::move(task2_info);
-		proj2_exprs.push_back(std::move(task2_predict));
-
-		auto proj2 = make_uniq<LogicalProjection>(proj2_idx, std::move(proj2_exprs));
-		proj2->children.push_back(std::move(op->children[0]));
-		op->children[0] = std::move(proj2);
+		auto &join_parent = chain.empty() ? *op : *chain.back();
+		join_parent.children[0] = std::move(comparison_join);
+		plan_shape = "COMPARISON_JOIN on the extracted columns";
+	} else {
+		// The filter references the extracted columns, passed up through the projection chain (bottom first).
+		ColumnBinding filter_side[2] = {task_output[0], task_output[1]};
+		for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+			auto &proj = **it;
+			for (idx_t task = 0; task < 2; task++) {
+				proj.expressions.push_back(make_uniq<BoundColumnRefExpression>(output_type, filter_side[task]));
+				filter_side[task] = ColumnBinding(proj.table_index, proj.expressions.size() - 1);
+			}
+			proj.ResolveOperatorTypes();
+		}
+		auto theta = make_uniq<BoundComparisonExpression>(
+		    comparison, make_uniq<BoundColumnRefExpression>(output_type, filter_side[0]),
+		    make_uniq<BoundColumnRefExpression>(output_type, filter_side[1]));
+		if (guarded) {
+			filter.guard_condition = std::move(theta);
+			filter.guard_fallback = std::move(orig_expr);
+			filter.decomposition_guard = guard;
+			plan_shape = "LLM_JOIN_GUARD [theta | fallback: original PREDICT]";
+		} else {
+			filter.expressions.push_back(std::move(theta));
+			plan_shape = "FILTER [theta]";
+		}
 	}
 
-	// ------------------------------------------------------------------
-	// 5. Rewrite the filter: replace all expressions with a single
-	//    comparison between the two extraction outputs from Proj2.
-	// ------------------------------------------------------------------
-	{
-		auto lhs = make_uniq<BoundColumnRefExpression>(
-		    decomposed.task1_output_type, ColumnBinding(proj2_idx, task1_out_pos));
-		auto rhs = make_uniq<BoundColumnRefExpression>(
-		    decomposed.task2_output_type, ColumnBinding(proj2_idx, task2_out_pos));
-		auto cmp = make_uniq<BoundComparisonExpression>(
-		    ParseComparisonOp(decomposed.predicate), std::move(lhs), std::move(rhs));
-
-		filter.expressions.clear();
-		filter.expressions.push_back(std::move(cmp));
-		// The filter no longer evaluates a PREDICT, so the early-stopping hint from
-		// LimitToPredictFilterPropagation does not apply; the LIMIT operator above still holds.
-		filter.limit = -1;
+	const char *op_sym = "=";
+	switch (comparison) {
+	case ExpressionType::COMPARE_NOTEQUAL:             op_sym = "!="; break;
+	case ExpressionType::COMPARE_LESSTHAN:             op_sym = "<"; break;
+	case ExpressionType::COMPARE_GREATERTHAN:          op_sym = ">"; break;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:    op_sym = "<="; break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: op_sym = ">="; break;
+	default:                                           break;
 	}
-
-	// ------------------------------------------------------------------
-	// Print the plan transformation for debugging.
-	// ------------------------------------------------------------------
-	auto op_to_str = [](ExpressionType t) -> const char * {
-		switch (t) {
-		case ExpressionType::COMPARE_EQUAL:                return "=";
-		case ExpressionType::COMPARE_NOTEQUAL:             return "!=";
-		case ExpressionType::COMPARE_LESSTHAN:             return "<";
-		case ExpressionType::COMPARE_GREATERTHAN:          return ">";
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:    return "<=";
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return ">=";
-		default:                                           return "?";
-		}
-	};
-	const char *op_sym = op_to_str(ParseComparisonOp(decomposed.predicate));
-
-	std::cout << "\n[SplitPredictJoin] Plan rewrite\n"
+	std::cout << "\n[SplitPredictJoin] Plan rewrite (" << decision_note << ")\n"
 	          << "  Original PREDICT prompt : " << orig_prompt << "\n"
 	          << "  Model                   : " << orig_model << "\n"
 	          << "  Decomposed task1 prompt : " << decomposed.task1 << "\n"
-	          << "  Task1 output column     : " << decomposed.task1_output_column << "\n"
 	          << "  Decomposed task2 prompt : " << decomposed.task2 << "\n"
-	          << "  Task2 output column     : " << decomposed.task2_output_column << "\n"
-	          << "  New plan structure:\n"
-	          << "    FILTER [" << decomposed.task1_output_column
-	          <<              " " << op_sym << " "
-	          <<              decomposed.task2_output_column << "]\n"
-	          << "      Proj2 [join cols + task1_passthrough + PREDICT(\""
-	          <<             decomposed.task2 << "\")]\n"
-	          << "        Proj1 [join cols + PREDICT(\""
-	          <<               decomposed.task1 << "\")]\n"
-	          << "          CROSS_PRODUCT\n\n" << std::endl;
-
-	// ------------------------------------------------------------------
-	// 6. Record binding fix so operators above this filter are updated:
-	//    old join binding[i] → {proj2_idx, i}
-	// ------------------------------------------------------------------
-	{
-		BindingFix fix;
-		fix.filter = op.get();
-		fix.old_bindings.reserve(join_bindings.size());
-		fix.new_bindings.reserve(join_bindings.size());
-		for (idx_t i = 0; i < join_bindings.size(); i++) {
-			fix.old_bindings.push_back(join_bindings[i]);
-			fix.new_bindings.push_back(ColumnBinding(proj2_idx, i));
-		}
-		pending_fixes.push_back(std::move(fix));
-	}
-
+	          << "  theta                   : " << decomposed.task1_output_column << " " << op_sym << " "
+	          << decomposed.task2_output_column << "\n"
+	          << "  New plan structure      : " << plan_shape << " over the join of\n"
+	          << "                            PROJ [side cols + PREDICT(task)] on each side\n" << std::endl;
+	transformed = true;
 #endif // ENABLE_PREDICT && ENABLE_LLM_API
 
 	return op;
@@ -789,9 +869,9 @@ SplitPredictJoinToExtractPredicate::Optimize(unique_ptr<LogicalOperator> plan) {
 	// Phase 1: find and transform all qualifying filter+join patterns.
 	plan = Transform(std::move(plan));
 
-	// Phase 2: for every transformed filter, apply a ColumnBindingReplacer on
-	// the operators that sit *above* the filter so that their column refs are
-	// updated from the old join bindings to the new Proj2 bindings.
+	// Phase 2: for every extraction projection inserted below a join, update
+	// the operators above it (the join, the filter and everything up to the
+	// root) from the side's old bindings to the projection's bindings.
 	for (auto &fix : pending_fixes) {
 		D_ASSERT(fix.old_bindings.size() == fix.new_bindings.size());
 
@@ -799,9 +879,12 @@ SplitPredictJoinToExtractPredicate::Optimize(unique_ptr<LogicalOperator> plan) {
 		for (idx_t i = 0; i < fix.old_bindings.size(); i++) {
 			replacer.replacement_bindings.emplace_back(fix.old_bindings[i], fix.new_bindings[i]);
 		}
-		// Stop at the filter itself – it and its new children are already correct.
-		replacer.stop_operator = fix.filter;
+		// Stop at the projection itself: its pass-through expressions refer to the old bindings.
+		replacer.stop_operator = fix.stop_operator;
 		replacer.VisitOperator(*plan);
+	}
+	if (transformed) {
+		plan->ResolveOperatorTypes();
 	}
 
 	return plan;

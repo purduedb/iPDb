@@ -25,6 +25,17 @@ enum class JoinDecompositionMode : uint8_t {
 	NEVER
 };
 
+//! Role of an expression in a runtime-checked (guarded) join decomposition.
+enum class DecompositionGuardRole : uint8_t {
+	NONE,
+	//! The extraction on the join's build side (materialized before any pair exists); records statistics
+	BUILD_EXTRACTION,
+	//! The extraction on the join's probe side; records a sample while undecided, stops after a fallback
+	PROBE_EXTRACTION
+};
+
+class DecompositionGuardState;
+
 inline string JoinDecompositionModeToString(JoinDecompositionMode mode) {
 	switch (mode) {
 	case JoinDecompositionMode::AUTO:

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/enums/join_decomposition_mode.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
 namespace duckdb {
@@ -23,6 +24,14 @@ public:
 
 	vector<idx_t> projection_map;
 	int limit = -1;
+
+	//! Runtime-checked join decomposition (T2): the decomposed predicate θ and the original LLM join predicate.
+	//! When set, the filter evaluates `expressions AND (θ or fallback)`, choosing at runtime. They are kept out
+	//! of `expressions` so that filter reordering and pruning passes leave them alone; the expression
+	//! enumeration (binding resolution, column lifetime) still visits them.
+	unique_ptr<Expression> guard_condition;
+	unique_ptr<Expression> guard_fallback;
+	shared_ptr<DecompositionGuardState> decomposition_guard;
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override;

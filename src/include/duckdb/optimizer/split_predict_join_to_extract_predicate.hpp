@@ -16,17 +16,19 @@
 namespace duckdb {
 class Optimizer;
 
-//! If a LogicalFilter sits directly on top of a join and its expressions contain
-//! a PREDICT call whose input columns span *both* sides of the join, this rule
-//! rewrites the plan into:
+//! Join decomposition. If a LogicalFilter sits on top of a join (directly or through a projection) and one of its
+//! conjuncts is a two-input PREDICT whose inputs come from the two sides of the join, an LLM planning call splits
+//! it into one single-input extraction per side plus a comparison θ, and the plan becomes:
 //!
-//!   LogicalFilter  [predicate referencing projected PREDICT output col]
-//!     └─ LogicalProjection2  [all join cols  +  PREDICT output as extra col]
-//!          └─ LogicalProjection1  [all join cols  (identity pass-through)]
-//!               └─ <original join>
+//!   FILTER / LLM_JOIN_GUARD  [other conjuncts AND θ(task1, task2)]
+//!     └─ JOIN
+//!          ├─ PROJECTION [side-0 cols + PREDICT(task on side 0)]
+//!          └─ PROJECTION [side-1 cols + PREDICT(task on side 1)]
 //!
-//! Column bindings in parent operators are updated via ColumnBindingReplacer so
-//! that the rest of the plan remains consistent.
+//! Whether to decompose is decided at plan time from estimated costs (T1) and user settings (T3). In AUTO mode
+//! the filter becomes an LLM_JOIN_GUARD that checks the extracted values at runtime and falls back to the
+//! original pairwise PREDICT if they look wrong (T2). Without the check, a cross product becomes a comparison
+//! join on θ. Column bindings above each inserted projection are updated via ColumnBindingReplacer.
 class SplitPredictJoinToExtractPredicate {
 public:
 	explicit SplitPredictJoinToExtractPredicate(Optimizer &optimizer);
@@ -42,16 +44,18 @@ public:
 private:
 	// One pending binding-fix entry per transformed filter node.
 	struct BindingFix {
-		//! The filter operator (used as stop_operator for ColumnBindingReplacer).
-		LogicalOperator *filter;
-		//! Parallel vectors: old_bindings[i] was the join output binding that is
-		//! now represented by new_bindings[i] in Projection2.
+		//! The inserted extraction projection (used as stop_operator for ColumnBindingReplacer).
+		LogicalOperator *stop_operator;
+		//! Parallel vectors: old_bindings[i] was a join-side binding that is
+		//! now represented by new_bindings[i] in the extraction projection.
 		vector<ColumnBinding> old_bindings;
 		vector<ColumnBinding> new_bindings;
 	};
 
 	Optimizer &optimizer;
 	vector<BindingFix> pending_fixes;
+	//! Whether any filter+join was rewritten
+	bool transformed = false;
 
 	//! Recursive top-down pass that transforms matching filter+join nodes.
 	unique_ptr<LogicalOperator> Transform(unique_ptr<LogicalOperator> op);

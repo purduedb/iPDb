@@ -90,6 +90,8 @@ unique_ptr<Expression> BoundPredictExpression::Copy() const {
 		copy_info->is_join = bound_predict->is_join;
 		copy_info->join_left_inputs = bound_predict->join_left_inputs;
 		copy_info->decomposition_note = bound_predict->decomposition_note;
+		copy_info->decomposition_guard = bound_predict->decomposition_guard;
+		copy_info->guard_role = bound_predict->guard_role;
 	}
 
 	auto copy = make_uniq<BoundPredictExpression>(return_type, std::move(new_children));

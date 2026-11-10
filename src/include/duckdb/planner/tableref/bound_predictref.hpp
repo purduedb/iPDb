@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb/common/enums/model_type.hpp"
+#include "duckdb/common/enums/join_decomposition_mode.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -55,6 +57,10 @@ struct BoundPredictInfo {
 	//! On the original join predicate it explains why it was kept; on a decomposed extraction task it explains
 	//! why the rewrite was chosen.
 	string decomposition_note;
+	//! Runtime check of a decomposed join (T2): state shared with the guard above the join, and this
+	//! expression's role in it. Null / NONE outside guarded decompositions.
+	shared_ptr<DecompositionGuardState> decomposition_guard;
+	DecompositionGuardRole guard_role = DecompositionGuardRole::NONE;
 
 	bool Equals(const BoundPredictInfo &other) const {
 		return model_type == other.model_type && model_name == other.model_name &&
