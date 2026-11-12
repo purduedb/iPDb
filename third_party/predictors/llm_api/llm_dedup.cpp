@@ -11,20 +11,19 @@
 namespace duckdb {
 
 // Returns the number of rows to sample from a cluster for verification.
-// Formula: floor(sqrt(cluster_size - 1)), capped at LLM_CLUSTER_VERIFY_SAMPLE_MAX.
-static idx_t cluster_sample_size(const idx_t n) {
+// Formula: floor(sqrt(cluster_size - 1)), capped at verify_max.
+static idx_t cluster_sample_size(const idx_t n, const idx_t verify_max) {
 	if (n <= 1) {
 		return 0;
 	}
-	return std::min(static_cast<idx_t>(std::sqrt(static_cast<float>(n - 1))),
-	                static_cast<idx_t>(LLM_CLUSTER_VERIFY_SAMPLE_MAX));
+	return std::min(static_cast<idx_t>(std::sqrt(static_cast<float>(n - 1))), verify_max);
 }
 
 // Selects evenly-spaced rows from rows[1:] and stores them in TupleCluster::sample.
-static void populate_cluster_samples(std::vector<TupleCluster> &clusters) {
+static void populate_cluster_samples(std::vector<TupleCluster> &clusters, const idx_t verify_max) {
 	for (auto &c : clusters) {
 		const idx_t n = static_cast<idx_t>(c.rows.size());
-		const idx_t k = cluster_sample_size(n);
+		const idx_t k = cluster_sample_size(n, verify_max);
 		c.sample.reserve(k);
 		for (idx_t s = 0; s < k; ++s) {
 			c.sample.push_back(c.rows[1 + (s * (n - 1)) / k]);
@@ -86,6 +85,10 @@ std::vector<std::vector<float>> LlmApiPredictor::EmbedTexts(const std::vector<st
 	request["input"] = texts;
 
 	const auto response = api->post("embeddings", request);
+	embed_calls++;
+	if (response.contains("usage") && response["usage"].contains("total_tokens")) {
+		embed_tokens += response["usage"]["total_tokens"].get<size_t>();
+	}
 	if (!response.contains("data") || !response["data"].is_array()) {
 		LLM_LOG("EmbedTexts: embeddings call failed or returned no data\n");
 		return {};
@@ -110,7 +113,6 @@ std::vector<std::vector<float>> LlmApiPredictor::EmbedTexts(const std::vector<st
 // representative row and is used for the downstream LLM prompt and cache lookup.
 std::vector<TupleCluster> LlmApiPredictor::GroupByClusters(const DataChunk &input, const idx_t rows,
                                                            const PredictInfo &info) const {
-	std::cout << "Called GroupByClusters!" << std::endl;
 	std::vector<std::string> prompt_keys;
 	prompt_keys.reserve(rows);
 	for (idx_t i = 0; i < rows; ++i) {
@@ -187,18 +189,21 @@ std::vector<TupleCluster> LlmApiPredictor::GroupByClusters(const DataChunk &inpu
 	const bool use_embeddings = (embeddings.size() == rows);
 
 	if (use_embeddings) {
-		std::cout << "In use_embeddings!" << std::endl;
 		std::vector<TupleCluster> clusters;
+		// Runtime choice (SET llm_speculation); the compile-time default is used when it is off, which only
+		// happens on the LLM_USE_CLUSTER code paths.
+		const int technique = spec.technique >= 0 ? spec.technique : LLM_CLUSTER_TECHNIQUE;
+		const float threshold = spec.technique >= 0 ? spec.threshold : LLM_CLUSTER_SIMILARITY_THRESHOLD;
+		const idx_t k_conf = spec.technique >= 0 ? spec.k : static_cast<idx_t>(LLM_CLUSTER_K);
 
-#if LLM_CLUSTER_TECHNIQUE == LLM_CLUSTER_GREEDY
+		if (technique == LLM_CLUSTER_GREEDY) {
 		// Each row joins the first cluster whose centroid exceeds the similarity threshold;
 		// if none qualifies, the row seeds a new cluster.
-		LLM_LOG("GroupByClusters: GREEDY (threshold=" +
-		        std::to_string(LLM_CLUSTER_SIMILARITY_THRESHOLD) + ")\n");
+		LLM_LOG("GroupByClusters: GREEDY (threshold=" + std::to_string(threshold) + ")\n");
 		std::vector<std::vector<float>> centroids;
 		for (idx_t i = 0; i < rows; ++i) {
 			idx_t best_cluster = static_cast<idx_t>(clusters.size()); // sentinel = new cluster
-			float best_sim = LLM_CLUSTER_SIMILARITY_THRESHOLD;
+			float best_sim = threshold;
 			for (idx_t ci = 0; ci < static_cast<idx_t>(clusters.size()); ++ci) {
 				const float sim = cosine_similarity(embeddings[i], centroids[ci]);
 				if (sim > best_sim) {
@@ -214,63 +219,67 @@ std::vector<TupleCluster> LlmApiPredictor::GroupByClusters(const DataChunk &inpu
 			}
 		}
 
-#elif LLM_CLUSTER_TECHNIQUE == LLM_CLUSTER_KNN
-		// k-means++ initialisation: seed = row 0, then repeatedly pick the row
-		// with the greatest minimum distance to any existing centroid.
-		std::cout << "In knn logic!" << std::endl;
-		const idx_t k = std::min(static_cast<idx_t>(LLM_CLUSTER_K), rows);
+		} else if (technique == LLM_CLUSTER_KNN) {
+		// Farthest-point (k-means++-style, deterministic) seeding: seed = row 0, then repeatedly pick the row
+		// with the greatest minimum distance to the chosen centroids; every row then joins its nearest
+		// centroid. The minimum distances are updated incrementally, O(k * rows).
+		const idx_t k = std::min(k_conf, rows);
 		LLM_LOG("GroupByClusters: KNN (k=" + std::to_string(k) + ")\n");
 		std::vector<idx_t> centroid_rows;
 		centroid_rows.reserve(k);
-		centroid_rows.push_back(0);
+		std::vector<bool> is_centroid(rows, false);
+		std::vector<float> min_dist(rows, 2.0f);
+		if (k > 0) {
+			centroid_rows.push_back(0);
+			is_centroid[0] = true;
+		}
 		while (centroid_rows.size() < static_cast<size_t>(k)) {
+			const idx_t last = centroid_rows.back();
 			float max_min_dist = -1.0f;
-			idx_t next = centroid_rows.back();
+			idx_t next = last;
 			for (idx_t i = 0; i < rows; ++i) {
-				bool is_seed = false;
-				for (const idx_t ci : centroid_rows) {
-					if (ci == i) { is_seed = true; break; }
+				if (is_centroid[i]) {
+					continue;
 				}
-				if (is_seed) continue;
-				float min_dist = 2.0f;
-				for (const idx_t ci : centroid_rows) {
-					const float d = 1.0f - cosine_similarity(embeddings[i], embeddings[ci]);
-					if (d < min_dist) min_dist = d;
+				const float d = 1.0f - cosine_similarity(embeddings[i], embeddings[last]);
+				if (d < min_dist[i]) {
+					min_dist[i] = d;
 				}
-				if (min_dist > max_min_dist) {
-					max_min_dist = min_dist;
+				if (min_dist[i] > max_min_dist) {
+					max_min_dist = min_dist[i];
 					next = i;
 				}
 			}
 			centroid_rows.push_back(next);
+			is_centroid[next] = true;
 		}
 		clusters.reserve(k);
 		for (const idx_t ci : centroid_rows) {
 			clusters.push_back({prompt_keys[ci], {ci}});
 		}
 		// Assign every non-centroid row to its nearest centroid.
-		for (idx_t i = 0; i < rows; ++i) {
-			bool is_centroid = false;
-			for (const idx_t ci : centroid_rows) {
-				if (ci == i) { is_centroid = true; break; }
+		for (idx_t i = 0; i < rows && k > 0; ++i) {
+			if (is_centroid[i]) {
+				continue;
 			}
-			if (is_centroid) continue;
 			idx_t best = 0;
 			float best_sim = cosine_similarity(embeddings[i], embeddings[centroid_rows[0]]);
 			for (idx_t c = 1; c < k; ++c) {
 				const float sim = cosine_similarity(embeddings[i], embeddings[centroid_rows[c]]);
-				if (sim > best_sim) { best_sim = sim; best = c; }
+				if (sim > best_sim) {
+					best_sim = sim;
+					best = c;
+				}
 			}
 			clusters[best].rows.push_back(i);
 		}
 
-#elif LLM_CLUSTER_TECHNIQUE == LLM_CLUSTER_AHC
+		} else {
 		// Agglomerative hierarchical clustering with centroid linkage.
 		// Each row starts as its own cluster. At every step the pair of clusters with
 		// the highest centroid cosine-similarity is merged; the new centroid is the
 		// weighted average of the two. Stops when no pair exceeds the threshold.
-		LLM_LOG("GroupByClusters: AHC (threshold=" +
-		        std::to_string(LLM_CLUSTER_SIMILARITY_THRESHOLD) + ")\n");
+		LLM_LOG("GroupByClusters: AHC (threshold=" + std::to_string(threshold) + ")\n");
 		std::vector<std::vector<float>> centroids(rows);
 		clusters.reserve(rows);
 		for (idx_t i = 0; i < rows; ++i) {
@@ -291,7 +300,7 @@ std::vector<TupleCluster> LlmApiPredictor::GroupByClusters(const DataChunk &inpu
 					}
 				}
 			}
-			if (best_sim < LLM_CLUSTER_SIMILARITY_THRESHOLD) break;
+			if (best_sim < threshold) break;
 			// Merge best_b into best_a; update centroid as weighted average.
 			const float wa = static_cast<float>(clusters[best_a].rows.size());
 			const float wb = static_cast<float>(clusters[best_b].rows.size());
@@ -308,11 +317,12 @@ std::vector<TupleCluster> LlmApiPredictor::GroupByClusters(const DataChunk &inpu
 			centroids[best_b] = std::move(centroids.back());
 			centroids.pop_back();
 		}
-#endif
+		}
 
 		LLM_LOG("GroupByClusters: " + std::to_string(rows) + " rows → " +
 		        std::to_string(clusters.size()) + " clusters\n");
-		populate_cluster_samples(clusters);
+		populate_cluster_samples(clusters, spec.technique >= 0 ? spec.verify_max
+		                                                        : static_cast<idx_t>(LLM_CLUSTER_VERIFY_SAMPLE_MAX));
 		return clusters;
 	}
 
@@ -330,7 +340,8 @@ std::vector<TupleCluster> LlmApiPredictor::GroupByClusters(const DataChunk &inpu
 			clusters[it->second].rows.push_back(i);
 		}
 	}
-	populate_cluster_samples(clusters);
+	populate_cluster_samples(clusters, spec.technique >= 0 ? spec.verify_max
+		                                                        : static_cast<idx_t>(LLM_CLUSTER_VERIFY_SAMPLE_MAX));
 	return clusters;
 }
 

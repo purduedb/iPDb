@@ -3,6 +3,10 @@
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -423,6 +427,10 @@ struct DecompositionEstimate {
 	double pairwise = 0;
 	double decomposed = 0;
 	bool decompose = false;
+	//! The sizes come from counting the subplans at plan time, not from DuckDB's estimates
+	bool counted = false;
+	//! Counting the join stopped at its cap: the true number of pairs is at least `pairs`
+	bool pairs_lower_bound = false;
 };
 
 static double OperatorCardinality(ClientContext &context, LogicalOperator &op) {
@@ -430,23 +438,112 @@ static double OperatorCardinality(ClientContext &context, LogicalOperator &op) {
 	return static_cast<double>(cardinality);
 }
 
+// ---------------------------------------------------------------------------
+// Plan-time counting (join_decomposition_count). DuckDB's estimates are often far off for the joins this rule
+// sees: a filter on a skewed column is estimated under uniformity (SemBench: ~11 of a movie's 256 reviews), and a
+// self-join with an extra inequality is estimated at 0 pairs (true: 65,280). Both sides and the join are plain
+// relational subplans (no LLM calls), so they are cheap to run next to the planning call: we copy each one into
+// a side connection and count its rows, stopping at a cap once the count can no longer change the decision.
+// Falls back to the estimates if a subplan contains a PREDICT, can't be copied, or fails.
+// ---------------------------------------------------------------------------
+static constexpr idx_t DECOMPOSITION_COUNT_CAP = 10000000;
+
+static bool ContainsPredict(LogicalOperator &op) {
+	bool found = false;
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
+		if (!found && *expr && FindFirstPredict(**expr)) {
+			found = true;
+		}
+	});
+	for (auto &child : op.children) {
+		if (!found) {
+			found = ContainsPredict(*child);
+		}
+	}
+	return found;
+}
+
+//! Counts the rows `op` produces, up to `cap`. Returns false if it can't (the caller keeps the estimate).
+static bool CountRows(ClientContext &context, const LogicalOperator &op, idx_t cap, idx_t &count) {
+	try {
+		Connection con(*context.db);
+		auto &side = *con.context;
+		ClientConfig::GetConfig(side).enable_optimizer = false; // the subplan is already optimized
+		con.BeginTransaction();
+		auto plan = op.Copy(side);
+		auto pending = side.PendingQuery(make_uniq<LogicalPlanStatement>(std::move(plan)), true);
+		if (pending->HasError()) {
+			return false;
+		}
+		auto result = pending->Execute();
+		if (result->HasError()) {
+			return false;
+		}
+		count = 0;
+		while (count < cap) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			count += chunk->size();
+		}
+		result.reset();
+		con.Rollback();
+		return true;
+	} catch (std::exception &) {
+		return false;
+	}
+}
+
 static DecompositionEstimate EstimateDecomposition(ClientContext &context, LogicalOperator &filter_child,
-                                                   int64_t limit, double selectivity, double min_speedup) {
+                                                   int64_t limit, double selectivity, double min_speedup,
+                                                   bool count_rows) {
 	DecompositionEstimate est;
 	// The filter's child is the join, or a chain of projections on top of it (see CanOptimize).
 	LogicalOperator *join = FindJoinBelow(filter_child);
 	if (!join) {
 		join = &filter_child;
 	}
+	const bool cross = join->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT;
 	if (join->children.size() == 2) {
 		est.left = OperatorCardinality(context, *join->children[0]);
 		est.right = OperatorCardinality(context, *join->children[1]);
 	}
-	if (join->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || join->children.size() != 2) {
+	if (cross || join->children.size() != 2) {
 		est.pairs = join->children.size() == 2 ? est.left * est.right : OperatorCardinality(context, *join);
 	} else {
 		est.pairs = OperatorCardinality(context, *join);
 	}
+
+	if (count_rows && join->children.size() == 2 && !ContainsPredict(*join)) {
+		idx_t left = 0, right = 0;
+		if (CountRows(context, *join->children[0], DECOMPOSITION_COUNT_CAP, left) &&
+		    CountRows(context, *join->children[1], DECOMPOSITION_COUNT_CAP, right)) {
+			est.left = static_cast<double>(left);
+			est.right = static_cast<double>(right);
+			est.counted = true;
+			if (cross) {
+				est.pairs = est.left * est.right;
+			} else {
+				// Count the join only as far as the decision needs: once pairs >= the decomposition threshold
+				// (and >= k/s under a LIMIT, where pairwise inference stops early), more pairs change nothing.
+				double needed = min_speedup * (DECOMPOSITION_REWRITE_COST + est.left + est.right);
+				if (limit >= 0) {
+					needed = MaxValue<double>(needed, static_cast<double>(limit) / selectivity);
+				}
+				auto cap = static_cast<idx_t>(MinValue<double>(std::ceil(needed) + 1, DECOMPOSITION_COUNT_CAP));
+				idx_t pairs = 0;
+				if (CountRows(context, *join, cap, pairs)) {
+					est.pairs = static_cast<double>(pairs);
+					est.pairs_lower_bound = pairs >= cap;
+				} else {
+					// Keep DuckDB's join estimate (the sides stay counted); the note then doesn't say "counted".
+					est.counted = false;
+				}
+			}
+		}
+	}
+
 	est.pairs_eff = est.pairs;
 	if (limit >= 0) {
 		est.pairs_eff = MinValue<double>(est.pairs, static_cast<double>(limit) / selectivity);
@@ -467,8 +564,10 @@ static string DecompositionNote(const DecompositionEstimate &est, double min_spe
 	if (!speedup.empty() && speedup.back() == '.') {
 		speedup.pop_back();
 	}
-	return string("auto, pairwise ") + FormatCost(est.pairwise) + (est.decompose ? " >= " : " < ") + speedup +
-	       "x decomposed " + FormatCost(est.decomposed);
+	// "counted" marks sizes counted at plan time; a "+" after pairwise marks a count stopped at its cap
+	return string("auto, pairwise ") + FormatCost(est.pairwise) +
+	       (est.pairs_lower_bound && est.pairwise == est.pairs ? "+" : "") + (est.decompose ? " >= " : " < ") +
+	       speedup + "x decomposed " + FormatCost(est.decomposed) + (est.counted ? ", counted" : "");
 }
 
 #endif // ENABLE_PREDICT && ENABLE_LLM_API
@@ -653,7 +752,8 @@ SplitPredictJoinToExtractPredicate::TransformFilterJoin(unique_ptr<LogicalOperat
 		break;
 	case JoinDecompositionMode::AUTO: {
 		auto est = EstimateDecomposition(optimizer.context, direct_child, filter.limit,
-		                                 config.join_decomposition_selectivity, config.join_decomposition_min_speedup);
+		                                 config.join_decomposition_selectivity, config.join_decomposition_min_speedup,
+		                                 config.join_decomposition_count);
 		decision_note = DecompositionNote(est, config.join_decomposition_min_speedup);
 		if (!est.decompose) {
 			orig_info.decomposition_note = decision_note;

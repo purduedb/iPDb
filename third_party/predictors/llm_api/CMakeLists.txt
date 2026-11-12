@@ -14,7 +14,8 @@ add_library(duckdb_llm_api STATIC
         llm_grammar.cpp
         llm_batching.cpp
         llm_predict.cpp
-        llm_dedup.cpp)
+        llm_dedup.cpp
+        llm_speculation.cpp)
 target_compile_definitions(duckdb_llm_api PRIVATE $<$<BOOL:${ENABLE_LLM_API}>:ENABLE_LLM_API>)
 
 target_link_libraries(duckdb_llm_api ${CURL_LIBRARIES})

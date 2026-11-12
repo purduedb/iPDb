@@ -326,6 +326,30 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 		}
 	}
 
+	// Speculative inference for LLM PREDICT operators (third_party/predictors/llm_api/llm_speculation.cpp).
+	if (!config.HasExtensionOption("llm_speculation")) {
+		config.AddExtensionOption("llm_speculation",
+		                          "Speculative inference for LLM selects/projects: off, greedy, knn or ahc",
+		                          LogicalType::VARCHAR, Value("off"));
+		config.AddExtensionOption("llm_speculation_threshold",
+		                          "Cosine-similarity threshold for greedy and ahc speculative clustering",
+		                          LogicalType::DOUBLE, Value::DOUBLE(0.7));
+		config.AddExtensionOption("llm_speculation_k", "Number of clusters for knn speculative clustering",
+		                          LogicalType::BIGINT, Value::BIGINT(512));
+		config.AddExtensionOption("llm_speculation_verify_max",
+		                          "Maximum verification sample per cluster (min(floor(sqrt(n-1)), this))",
+		                          LogicalType::BIGINT, Value::BIGINT(3));
+		config.AddExtensionOption("llm_speculation_fallback",
+		                          "What a failed verification triggers: none, cluster or operator",
+		                          LogicalType::VARCHAR, Value("none"));
+		config.AddExtensionOption("llm_speculation_tolerance",
+		                          "Fallback when the verification mismatch rate exceeds this fraction",
+		                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
+		config.AddExtensionOption("llm_speculation_min_reduction",
+		                          "Skip speculation for a chunk when 1 - (clusters + samples) / rows is below this",
+		                          LogicalType::DOUBLE, Value::DOUBLE(0.0));
+	}
+
 	LoadExtensionSettings();
 
 	if (!db_manager->HasDefaultDatabase()) {

@@ -1608,6 +1608,18 @@ Value JoinDecompositionCheckSetting::GetSetting(const ClientContext &context) {
 	return Value::BOOLEAN(ClientConfig::GetConfig(context).join_decomposition_check);
 }
 
+void JoinDecompositionCountSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).join_decomposition_count = input.GetValue<bool>();
+}
+
+void JoinDecompositionCountSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).join_decomposition_count = ClientConfig().join_decomposition_count;
+}
+
+Value JoinDecompositionCountSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).join_decomposition_count);
+}
+
 void JoinDecompositionSampleSetting::SetLocal(ClientContext &context, const Value &input) {
 	auto value = input.GetValue<uint64_t>();
 	if (value == 0) {

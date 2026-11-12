@@ -21,6 +21,32 @@ struct TupleCluster {
 	vector<idx_t> sample; // subset of rows[1:] chosen for post-hoc verification
 };
 
+// Runtime configuration of speculative inference (SET llm_speculation* ...). technique < 0 = off.
+// Read once per operator in LlmApiPredictor::Config.
+struct SpeculationConfig {
+	int technique = -1;      // -1 off, else LLM_CLUSTER_GREEDY / LLM_CLUSTER_KNN / LLM_CLUSTER_AHC
+	float threshold = 0.7f;  // cosine-similarity threshold (greedy, ahc)
+	idx_t k = 512;           // number of clusters (knn)
+	idx_t verify_max = 3;    // cap on the per-cluster verification sample
+	int fallback = 0;        // 0 none (only the sampled rows get their own output), 1 cluster, 2 operator
+	double tolerance = 0.0;  // fall back when the mismatch rate of the samples exceeds this
+	double min_reduction = 0.0; // skip speculation for a chunk if 1 - (clusters + samples) / rows is below this
+};
+
+// LLM usage of one phase of speculative inference.
+struct SpecCounters {
+	size_t calls = 0;
+	size_t tokens = 0;
+	size_t in_tokens = 0;
+	size_t out_tokens = 0;
+	void Add(const SpecCounters &o) {
+		calls += o.calls;
+		tokens += o.tokens;
+		in_tokens += o.in_tokens;
+		out_tokens += o.out_tokens;
+	}
+};
+
 struct BatchResult {
 	size_t tokens;
 	size_t in_tokens;
@@ -48,8 +74,13 @@ public:
 
 	idx_t n_threads;
 	idx_t req_per_min;
+	SpeculationConfig spec;
 
 private:
+	// Embeddings calls made while clustering when there is no precomputed embedding column; reset per chunk.
+	mutable size_t embed_tokens = 0;
+	mutable size_t embed_calls = 0;
+
 	PromptUtil prompt_util;
 	unique_ptr<OpenAI> api;
 
@@ -94,6 +125,14 @@ private:
 							   map<string, vector<idx_t>> &tuple_id_map,
 							   DataChunk &output, const PredictInfo &info,
 							   map<string, string> *rep_outputs = nullptr);
+
+	// Speculative inference (llm_speculation != 'off'): cluster, infer representatives, verify samples, fall back.
+	void PredictChunkSpeculative(ClientContext &client, DataChunk &input, DataChunk &output, idx_t rows,
+	                             const PredictInfo &info, unique_ptr<PredictStats> &stats);
+	// Runs one LLM pass over the keys of 'keyed' (prompt string -> output rows) with the usual batching and
+	// parallelism, writes each result to all of its rows and records the raw per-key output in 'outs'.
+	void RunKeyed(const map<string, vector<idx_t>> &keyed, DataChunk &output, const PredictInfo &info,
+	              map<string, string> &outs, SpecCounters &counters);
 
 	void VerifyClusters(const DataChunk &input, DataChunk &output,
 	                    const std::vector<TupleCluster> &clusters,

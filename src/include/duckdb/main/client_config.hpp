@@ -138,6 +138,9 @@ struct ClientConfig {
 	double join_decomposition_selectivity = 0.1;
 	//! Check a decomposed LLM join at runtime (first probe chunk) and fall back to pairwise inference if needed
 	bool join_decomposition_check = true;
+	//! AUTO mode: count the join's inputs and pairs at plan time (cheap relational subplans) instead of trusting
+	//! DuckDB's cardinality estimates, which skewed filters and self-joins make far off
+	bool join_decomposition_count = true;
 	//! Runtime check: distinct probe-side inputs to sample before deciding
 	idx_t join_decomposition_sample = 64;
 	//! Runtime check: fall back if either extraction yields unknown/NULL for more than this share of rows

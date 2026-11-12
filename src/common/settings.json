@@ -771,6 +771,13 @@
         "custom_implementation": true
     },
     {
+        "name": "join_decomposition_count",
+        "description": "Cost check: count the LLM join's inputs and pairs at plan time instead of using cardinality estimates",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "custom_implementation": true
+    },
+    {
         "name": "join_decomposition_max_selectivity",
         "description": "Runtime check: fall back if the decomposed join's estimated selectivity exceeds this",
         "type": "DOUBLE",

@@ -1139,6 +1139,17 @@ struct JoinDecompositionCheckSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct JoinDecompositionCountSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "join_decomposition_count";
+	static constexpr const char *Description =
+	    "Cost check: count the LLM join's inputs and pairs at plan time instead of using cardinality estimates";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct JoinDecompositionMaxSelectivitySetting {
 	using RETURN_TYPE = double;
 	static constexpr const char *Name = "join_decomposition_max_selectivity";

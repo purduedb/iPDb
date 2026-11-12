@@ -162,22 +162,28 @@ SourceResultType PhysicalCreateEmbedding::GetDataInternal(ExecutionContext &cont
 		auto openai = OpenAI::createInstance(db, model_data.base_api, api_key);
 
 		using json = nlohmann::json;
-		json request;
-		request["model"] = model_data.model_path;
-		request["input"] = source_strings;
-		if (info->embedding_size > 0) {
-			request["dimensions"] = info->embedding_size;
-		}
+		// Embeddings endpoints cap the inputs per request (OpenAI: 2,048), so send the column in batches.
+		constexpr idx_t EMBED_REQUEST_ROWS = 256;
+		for (idx_t start = 0; start < source_strings.size(); start += EMBED_REQUEST_ROWS) {
+			const idx_t end = MinValue<idx_t>(start + EMBED_REQUEST_ROWS, source_strings.size());
+			json request;
+			request["model"] = model_data.model_path;
+			request["input"] = vector<string>(source_strings.begin() + static_cast<int64_t>(start),
+			                                  source_strings.begin() + static_cast<int64_t>(end));
+			if (info->embedding_size > 0) {
+				request["dimensions"] = info->embedding_size;
+			}
 
-		auto response = openai->post("embeddings", request);
-		if (response.contains("error")) {
-			throw IOException("Embedding API error: %s", response["error"].get<std::string>());
-		}
+			auto response = openai->post("embeddings", request);
+			if (response.contains("error")) {
+				throw IOException("Embedding API error: %s", response["error"].dump());
+			}
 
-		if (response.contains("data")) {
-			for (auto &entry : response["data"]) {
-				if (entry.contains("embedding") && entry["embedding"].is_array()) {
-					embeddings.push_back(entry["embedding"].get<std::vector<float>>());
+			if (response.contains("data")) {
+				for (auto &entry : response["data"]) {
+					if (entry.contains("embedding") && entry["embedding"].is_array()) {
+						embeddings.push_back(entry["embedding"].get<std::vector<float>>());
+					}
 				}
 			}
 		}

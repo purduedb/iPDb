@@ -12,6 +12,10 @@ namespace duckdb {
 
 void LlmApiPredictor::PredictChunk(ClientContext &client, DataChunk &input, DataChunk &output, const idx_t rows,
                                    const PredictInfo &info, unique_ptr<PredictStats> &stats) {
+	if (spec.technique >= 0 && task == PREDICT_LLM_TASK && rows > 0) {
+		PredictChunkSpeculative(client, input, output, rows, info, stats);
+		return;
+	}
 	std::cout << ("No. tuples: " + std::to_string(rows) + "\n");
 #if LLM_USE_THREADS
 	LLM_LOG("No. of threads: " + std::to_string(this->n_threads) + "\n");

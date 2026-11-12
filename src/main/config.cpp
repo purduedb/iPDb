@@ -161,6 +161,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(IntegerDivisionSetting),
     DUCKDB_LOCAL(JoinDecompositionSetting),
     DUCKDB_LOCAL(JoinDecompositionCheckSetting),
+    DUCKDB_LOCAL(JoinDecompositionCountSetting),
     DUCKDB_LOCAL(JoinDecompositionMaxSelectivitySetting),
     DUCKDB_LOCAL(JoinDecompositionMaxUnknownSetting),
     DUCKDB_LOCAL(JoinDecompositionMinOverlapSetting),

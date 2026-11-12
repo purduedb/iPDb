@@ -2,6 +2,9 @@
 #include "llm_common.hpp"
 
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/common/exception.hpp"
 
 #include <atomic>
 #include <iostream>
@@ -32,6 +35,50 @@ void LlmApiPredictor::Config(const ClientContext &context, const case_insensitiv
 	this->req_per_min =
 	    options.find("req_per_min") != options.end() ? IntegerValue::Get(options.at("req_per_min")) : 500;
 	this->n_predict = 64;
+
+	// Speculative inference (registered in DatabaseInstance::Initialize; see llm_speculation.cpp).
+	Value v;
+	this->spec = SpeculationConfig();
+	if (context.TryGetCurrentSetting("llm_speculation", v) && !v.IsNull()) {
+		const auto mode = StringUtil::Lower(v.ToString());
+		if (mode == "greedy") {
+			spec.technique = LLM_CLUSTER_GREEDY;
+		} else if (mode == "knn") {
+			spec.technique = LLM_CLUSTER_KNN;
+		} else if (mode == "ahc") {
+			spec.technique = LLM_CLUSTER_AHC;
+		} else if (mode != "off" && mode != "none" && !mode.empty()) {
+			throw InvalidInputException("llm_speculation must be one of off, greedy, knn, ahc (got '%s')", mode);
+		}
+	}
+	if (context.TryGetCurrentSetting("llm_speculation_threshold", v) && !v.IsNull()) {
+		spec.threshold = static_cast<float>(v.GetValue<double>());
+	}
+	if (context.TryGetCurrentSetting("llm_speculation_k", v) && !v.IsNull()) {
+		spec.k = static_cast<idx_t>(std::max<int64_t>(1, v.GetValue<int64_t>()));
+	}
+	if (context.TryGetCurrentSetting("llm_speculation_verify_max", v) && !v.IsNull()) {
+		spec.verify_max = static_cast<idx_t>(std::max<int64_t>(0, v.GetValue<int64_t>()));
+	}
+	if (context.TryGetCurrentSetting("llm_speculation_tolerance", v) && !v.IsNull()) {
+		spec.tolerance = v.GetValue<double>();
+	}
+	if (context.TryGetCurrentSetting("llm_speculation_min_reduction", v) && !v.IsNull()) {
+		spec.min_reduction = v.GetValue<double>();
+	}
+	if (context.TryGetCurrentSetting("llm_speculation_fallback", v) && !v.IsNull()) {
+		const auto mode = StringUtil::Lower(v.ToString());
+		if (mode == "none") {
+			spec.fallback = 0;
+		} else if (mode == "cluster") {
+			spec.fallback = 1;
+		} else if (mode == "operator") {
+			spec.fallback = 2;
+		} else {
+			throw InvalidInputException("llm_speculation_fallback must be one of none, cluster, operator (got '%s')",
+			                            mode);
+		}
+	}
 }
 
 void LlmApiPredictor::Load(ClientContext &client, const std::string &path, unique_ptr<PredictStats> &stats) {
