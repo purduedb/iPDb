@@ -91,7 +91,10 @@ OperatorResultType PhysicalFilter::ExecuteInternal(ExecutionContext &context, Da
 
 		while (offset < input.size() && chunk.size() < LIMIT && state.tuples_processed < LIMIT) {
 			const idx_t count = MinValue<idx_t>(BATCH_SIZE, input.size() - offset);
-			idx_t this_count = state.executor.SelectExpression(input, state.sel, nullptr, offset + count);
+			for (idx_t i = 0; i < count; i++) {
+				batch_sel.set_index(i, offset + i);
+			}
+			idx_t this_count = state.executor.SelectExpression(input, state.sel, batch_sel, count);
 
 			idx_t batch_sel_count = 0;
 			for (idx_t i = 0; i < this_count; i++) {
